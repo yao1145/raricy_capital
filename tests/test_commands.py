@@ -289,6 +289,19 @@ async def test_lobby_and_plain_chat_are_ignored(store):
     assert sent_messages(client) == []
 
 
+async def test_opaque_direct_channel_id_is_accepted(store):
+    # Regression: the site's direct channels carry opaque uuids, not a "d_"
+    # prefix.  Requiring that prefix silently dropped every real command while
+    # the poll cursor kept advancing, so nothing was ever retried.
+    channel = '7d7946a9-3f3e-481d-8792-7deb029293aa'
+    ledger, client = FakeLedger(), FakeClient()
+    handler = CommandHandler(ledger, store, client, FUND, live=True)
+    await handler.handle(message(42, '/check', channel=channel), now_ms=NOW)
+    assert ledger.status_calls == [(FUND, 'u1')]
+    sends = sent_messages(client)
+    assert len(sends) == 1 and sends[0][1] == channel
+
+
 async def test_check_reads_only_own_holder_view(store):
     ledger, client = FakeLedger(), FakeClient()
     handler = CommandHandler(ledger, store, client, FUND, live=True)

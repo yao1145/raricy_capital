@@ -113,7 +113,11 @@ class CommandHandler:
         message_id = get_field(message, 'id')
         content = get_field(message, 'content') or ''
         # Private chat only; identity is the authoritative author.id.
-        if not isinstance(channel_id, str) or not channel_id.startswith('d_'):
+        # Direct channel ids are opaque (the site hands out bare uuids), so the
+        # guard names the one non-private channel instead of guessing a prefix:
+        # the shared ``lobby``.  ``client.private_channels`` already filters to
+        # ``kind == "direct"``, which is the primary gate.
+        if not isinstance(channel_id, str) or not channel_id or channel_id == 'lobby':
             return
         if not user_id or message_id is None:
             return
