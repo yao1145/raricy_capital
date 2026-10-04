@@ -29,7 +29,7 @@ emergency fee retained by the fund is not trading profit and is kept apart in
 ``non_trading_income_units``; the trader normalises by the sum of that field and
 ``capital_flows_units``.  Period bookkeeping (``period_start_nav``,
 ``period_trade_income_units``) lets a month's own investment profit gate its
-dividend, and the month-end/20:00 cutoffs freeze the book they price against.
+dividend, and the 7th-20:00 batch cutoffs freeze the book they price against.
 """
 from __future__ import annotations
 
@@ -248,17 +248,24 @@ def _period_from_ms(ms: int) -> str:
 
 
 def _period_cutoff_ms(period: str) -> int:
+    """When the period's settlement batch runs: the *next* month's 7th, 20:00.
+
+    The batch settles the calendar month that just ended, and it runs two hours
+    after that batch's own payment deadline (the 7th, 18:00) — so money received
+    inside the window is priced by the batch immediately following it instead of
+    idling until the next calendar month.
+    """
     try:
         year, month = (int(part) for part in period.split('-'))
         if month < 1 or month > 12:
             raise ValueError
-        start = datetime(year, month, 1, tzinfo=BEIJING)
+        datetime(year, month, 1, tzinfo=BEIJING)
     except (ValueError, TypeError, AttributeError):
         raise FundError('invalid_period') from None
     if month == 12:
-        nxt = datetime(year + 1, 1, 1, tzinfo=BEIJING)
+        nxt = datetime(year + 1, 1, 7, 20, tzinfo=BEIJING)
     else:
-        nxt = datetime(year, month + 1, 1, tzinfo=BEIJING)
+        nxt = datetime(year, month + 1, 7, 20, tzinfo=BEIJING)
     return int(nxt.timestamp() * 1000)
 
 
@@ -267,17 +274,32 @@ def _next_period(period: str) -> str:
     return f'{year + 1:04d}-01' if month == 12 else f'{year:04d}-{month + 1:02d}'
 
 
-def _period_window_ms(period: str) -> int:
-    """The 7th 18:00 (Beijing) application/payment deadline of a period."""
+def _previous_period(period: str) -> str:
     year, month = (int(part) for part in period.split('-'))
-    return int(datetime(year, month, 7, 18, tzinfo=BEIJING).timestamp() * 1000)
+    return f'{year - 1:04d}-12' if month == 1 else f'{year:04d}-{month - 1:02d}'
+
+
+def _period_window_ms(period: str) -> int:
+    """The period's application/payment deadline: the *next* month's 7th, 18:00.
+
+    A period's window opens on the 1st of the following calendar month, so a
+    receipt accepted for period ``P`` lands in ``P+1`` days 1-7.
+    """
+    year, month = (int(part) for part in period.split('-'))
+    if month == 12:
+        return int(datetime(year + 1, 1, 7, 18, tzinfo=BEIJING).timestamp() * 1000)
+    return int(datetime(year, month + 1, 7, 18, tzinfo=BEIJING).timestamp() * 1000)
 
 
 def _cutoff_for_now(now_ms: int) -> tuple[str, int]:
-    """Most recent month-end cutoff that ``now_ms`` has passed."""
+    """Most recent 7th-20:00 settlement boundary that ``now_ms`` has passed."""
     dt = datetime.fromtimestamp(now_ms / 1000, BEIJING)
-    cutoff_ms = int(_month_start(dt).timestamp() * 1000)
-    return _period_from_ms(cutoff_ms - 1), cutoff_ms
+    boundary = dt.replace(day=7, hour=20, minute=0, second=0, microsecond=0)
+    if now_ms < int(boundary.timestamp() * 1000):
+        # Before this month's batch: the previous month's batch is the latest one.
+        boundary = _month_start(_month_start(dt) - timedelta(days=1)).replace(day=7, hour=20)
+    month_start = _month_start(boundary)
+    return _period_from_ms(int(month_start.timestamp() * 1000) - 1), int(boundary.timestamp() * 1000)
 
 
 def _period_for_deadline(now_ms: int, deadline_day: int) -> tuple[str, int]:
@@ -292,12 +314,20 @@ def _period_for_deadline(now_ms: int, deadline_day: int) -> tuple[str, int]:
 
 
 def _ordinary_period(now_ms: int) -> tuple[str, int]:
-    """Receipts after the 7th 18:00 Beijing deadline belong to next month."""
-    return _period_for_deadline(now_ms, 7)
+    """The period a receipt received now is issued by, and that period's deadline.
+
+    A receipt on days 1-7 lands in the *previous* calendar month's batch: that
+    month has already ended, and its batch runs on this month's 7th at 20:00.
+    """
+    period = _previous_period(_period_for_deadline(now_ms, 7)[0])
+    return period, _period_window_ms(period)
 
 
 def _require_application_window(now_ms: int) -> None:
-    if now_ms > _period_window_ms(_period_from_ms(now_ms)):
+    """Applications are accepted on days 1-7 until that month's 18:00 deadline."""
+    dt = datetime.fromtimestamp(now_ms / 1000, BEIJING)
+    deadline = dt.replace(day=7, hour=18, minute=0, second=0, microsecond=0)
+    if now_ms > int(deadline.timestamp() * 1000):
         raise FundError('window_closed')
 
 
@@ -372,7 +402,7 @@ class FundLedger:
             details={'transfer_id': receipt['transfer_id'], 'subscription_id': match['id'],
                      'amount_units': amount, 'period': period})
         self._notify(fund_id, self.control_user_id,
-            f'机构本金到账 {money_text(amount)} 小鱼干，免手续费；按 {period} 月末净值确认份额', now,
+            f'机构本金到账 {money_text(amount)} 小鱼干，免手续费；按 {period} 结算批次净值确认份额', now,
             notice_id=f"control-capital:{fund_id}:{receipt['transfer_id']}")
         return receipt
 
@@ -673,7 +703,7 @@ class FundLedger:
     def _ensure_emergency_snapshot(self, fund_id: str, now_ms: int) -> None:
         """Freeze eligible holder/account marks as of each due batch's 20:00 price.
 
-        Mirrors the month-end freeze: the first write *after* a batch's valuation
+        Mirrors the batch freeze: the first write *after* a batch's valuation
         captures the book the 20:00 batch price must be applied to, so a later mark
         (for example a 22:00 quote) can neither re-price the batch nor move the
         eligible holders.  A mark exactly at 20:00 is the batch price itself and is
@@ -1029,12 +1059,12 @@ class FundLedger:
                     self._notify(
                         fund_id, from_user_id,
                         f'订单 {note} 已到账，但到账时间已过本月申购截止时点，'
-                        f'份额将于 {issue_period} 月末估值后确认；在此之前仍可撤回，'
+                        f'份额将于 {issue_period} 结算批次估值后确认；在此之前仍可撤回，'
                         '撤回时净本金与申购服务费全额返还。', now,
                         notice_id=f'sub-rollover:{fund_id}:{match["id"]}')
                 else:
                     self._notify(fund_id, from_user_id,
-                                 f'订单 {note} 已到账，将于月末估值后确认份额', now)
+                                 f'订单 {note} 已到账，将于结算批次估值后确认份额', now)
 
             self.store.put(_TRANSFERS, transfer_id, result)
             return result
@@ -1392,7 +1422,7 @@ class FundLedger:
         The money already sits in the wallet as an unclaimed liability; this only
         re-labels it as pending principal plus prepaid fee, so equity, shares and
         capital flows do not move.  Shares are issued later, by the existing
-        month-end settlement, under the order's own (possibly rolled) period.
+        settlement batch, under the order's own (possibly rolled) period.
         """
         sub = self.store.get(_SUBS, info['subscription']['id'])
         fund = self._fund(fund_id)
@@ -1434,7 +1464,7 @@ class FundLedger:
         self._notify(
             fund_id, sub['user_id'],
             f'到账 {money_text(total)} 小鱼干已人工核对并关联订单 {sub["payment_note"]}，'
-            f'份额将于 {issue_period} 月末估值后确认', now,
+            f'份额将于 {issue_period} 结算批次估值后确认', now,
             notice_id=f'unclaimed-link:{fund_id}:{record["id"]}')
         return self._commit_resolution(fund_id, record, 'linked', action='link', reason=reason,
                                        actor=actor, now=now, before=before, info=info,
@@ -1777,7 +1807,7 @@ class FundLedger:
         cutoff = _period_cutoff_ms(period)
         now = _as_ms(now_ms)
         if now < cutoff:
-            raise FundError('month_not_ended')  # no month-end look-ahead
+            raise FundError('month_not_ended')  # no settlement-batch look-ahead
         with self.store.transaction():
             self._ensure_cutoff_snapshot(fund_id, now)
             self._ensure_emergency_snapshot(fund_id, now)
@@ -2085,7 +2115,7 @@ class FundLedger:
             'retry_count': 0,
         }
         self.store.put(_PERIODS, key, record)
-        self._notify(fund_id, None, f'{period} 月末估值无效（{reason}），结算挂起', now)
+        self._notify(fund_id, None, f'{period} 结算批次估值无效（{reason}），结算挂起', now)
         return record
 
     def _period_record(self, fund_id: str, period: str, now: int, snapshot: dict,

@@ -384,13 +384,13 @@ async def test_older_pending_month_is_retried_and_blocks_newer_months(tmp_path, 
         t0 = _ms(2026, 1, 5)
         led.mark_account('capital1', 1000 * U, 0, t0, t0)
         led.seed('capital1', 'inst', 1000 * U, t0)
-        first = led.settle_month('capital1', '2026-01', _ms(2026, 2, 2))
+        first = led.settle_month('capital1', '2026-01', _ms(2026, 2, 8))
         assert first['status'] == 'pending_valuation'
 
         # February's own book is valid, but January is still unresolved.
         led.mark_account('capital1', 1000 * U, 0, _ms(2026, 2, 28, 23, 59, 55),
                          _ms(2026, 2, 28, 23, 59, 55))
-        await service._settlements(_ms(2026, 3, 2))
+        await service._settlements(_ms(2026, 3, 8))
 
         jan = service.store.get('periods', 'capital1:2026-01')
         assert jan['status'] == 'pending_valuation'
@@ -421,17 +421,17 @@ async def test_valid_older_snapshot_settles_in_sequence_and_dedups(tmp_path, mon
         t0 = _ms(2026, 1, 5)
         led.mark_account('capital1', 1000 * U, 0, t0, t0)
         led.seed('capital1', 'inst', 1000 * U, t0)
-        assert led.settle_month('capital1', '2026-01', _ms(2026, 2, 2))['status'] == 'pending_valuation'
+        assert led.settle_month('capital1', '2026-01', _ms(2026, 2, 8))['status'] == 'pending_valuation'
 
         # A genuinely pre-cutoff frozen book becomes available for January; the
         # ledger replays that snapshot rather than repricing it with a later quote.
         snapshot = service.store.get('cutoffs', 'capital1:2026-01')
-        snapshot['quote_ms'] = _ms(2026, 1, 31, 23, 59, 55)
+        snapshot['quote_ms'] = _ms(2026, 2, 7, 19, 59, 55)
         snapshot['updated_ms'] = snapshot['quote_ms']
         snapshot['captured_ms'] = snapshot['quote_ms']
         service.store.put('cutoffs', 'capital1:2026-01', snapshot)
 
-        await service._settlements(_ms(2026, 2, 2, 1))
+        await service._settlements(_ms(2026, 2, 8, 1))
         jan = service.store.get('periods', 'capital1:2026-01')
         assert jan['status'] == 'settled'
         assert service.store.get('runtime_settlements',
@@ -439,7 +439,7 @@ async def test_valid_older_snapshot_settles_in_sequence_and_dedups(tmp_path, mon
         shares = led.status('capital1')['shares_atoms']
         payouts = len(led.pending_payouts('capital1'))
 
-        await service._settlements(_ms(2026, 2, 2, 2))
+        await service._settlements(_ms(2026, 2, 8, 2))
         assert led.status('capital1')['shares_atoms'] == shares   # settled exactly once
         assert len(led.pending_payouts('capital1')) == payouts
     finally:
@@ -460,7 +460,7 @@ async def test_settlements_ignore_malformed_and_future_periods(tmp_path, monkeyp
         service.store.put('periods', 'capital1:2999-01',
                           {'period': '2999-01', 'status': 'pending_valuation'})
 
-        periods = service._settlement_periods('capital1', '2026-02', _ms(2026, 3, 2))
+        periods = service._settlement_periods('capital1', '2026-02', _ms(2026, 3, 8))
         assert 'not-a-period' not in periods and '2999-13' not in periods
         assert '2999-01' not in periods                      # future month ignored
         assert periods == ['2026-02']                        # only the previous month

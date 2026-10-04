@@ -14,7 +14,7 @@ from .adapters import TradingClientAdapter
 from .commands import CommandHandler
 from .config import CredentialVault, FundConfig
 from .contracts import BEIJING, FundError, POLICIES, money_units, now_ms
-from .ledger import FundLedger, _period_cutoff_ms
+from .ledger import FundLedger, _cutoff_for_now, _next_period, _period_cutoff_ms
 from .operations import ServiceOperations
 from .payments import PaymentsWorker
 from .store import FundStore
@@ -514,20 +514,24 @@ class FundService:
             return
         local = datetime.fromtimestamp(stamp / 1000, BEIJING)
         today20 = int(local.replace(hour=20, minute=0, second=0, microsecond=0).timestamp() * 1000)
-        next_month = (local.replace(day=28) + timedelta(days=4)).replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-        month_end = int(next_month.timestamp() * 1000)
+        # The next settlement batch and the period it prices.  Liquidity must be in
+        # place just before *that* batch (next month's 7th, 20:00), not before the
+        # calendar month turns over.
+        settled, _ = _cutoff_for_now(stamp)
+        due_period = _next_period(settled)
+        batch = _period_cutoff_ms(due_period)
         for fund_id in self.clients:
             state = self.ledger.status(fund_id)
             required = 0
             for order in self.ledger.orders(fund_id):
                 if order.get('status') != 'pending' or order.get('kind') not in ('ordinary', 'emergency'):
                     continue
-                due = (order.get('ready_ms', today20) if order['kind'] == 'emergency' else month_end)
-                if order['kind'] == 'ordinary' and order.get('period') != local.strftime('%Y-%m'):
+                due = (order.get('ready_ms', today20) if order['kind'] == 'emergency' else batch)
+                if order['kind'] == 'ordinary' and order.get('period') != due_period:
                     continue
                 if stamp >= due - 120000:
                     required += int(order.get('amount_units', 0))
-            if stamp >= month_end - 120000:
+            if stamp >= batch - 120000:
                 required = min(required, max(0, state['equity_units']) // 5) + max(0, state['realized_profit_units']) // 10
             self.store.put('settlement_holds', fund_id, {'hold': required > 0, 'required_units': required})
             if required > 0:

@@ -2,7 +2,7 @@
 
 Only the money-bearing rules are exercised here: the read-only preview, the
 atomic version CAS, the NAV-neutral manual link (issued by the *existing*
-month-end flow), the durable single-intent original-payer refund, the frozen
+settlement-batch flow), the durable single-intent original-payer refund, the frozen
 period / window boundaries, the conservative historical backlink rule and the
 audit trail.  Web/runtime gates are the other workers' tests.
 """
@@ -26,7 +26,7 @@ def ms(year, month, day, hour=0, minute=0, second=0):
     return int(datetime(year, month, day, hour, minute, second, tzinfo=BEIJING).timestamp() * 1000)
 
 
-T = ms(2026, 10, 4, 10)   # inside the 2026-10 application window
+T = ms(2026, 10, 4, 10)   # inside the 2026-09 window (days 1-7 close the prior month)
 
 
 @pytest.fixture
@@ -124,7 +124,7 @@ def test_manual_link_keeps_nav_neutral_and_issues_only_at_month_end(led):
     assert sub['status'] == 'received'
     assert sub['occurred_ms'] == T + 1000
     assert sub['payment_note'] == order['payment_note']          # never rewritten
-    assert sub['period'] == '2026-10'
+    assert sub['period'] == '2026-09'
     assert sub['manual_review']['original_note'] == 'wrong note'
     assert sub['manual_review']['actor'] == 'session-abc'
     assert led.store.get('transfers', 'in-1')['status'] == 'linked'
@@ -138,10 +138,12 @@ def test_manual_link_keeps_nav_neutral_and_issues_only_at_month_end(led):
     assert entry['after']['unclaimed_units'] == 0
     assert entry['after']['pending_receipts_units'] == 100 * U
 
-    # Month end: the linked receipt is issued by the existing flow at NAV 1.
-    when = ms(2026, 10, 31, 23, 59, 55)
+    # Settlement batch: the linked receipt is issued by that period's 7th-20:00
+    # batch at NAV 1.  The order's 2026-09 batch runs on 2026-10-07 20:00; the mark
+    # five seconds earlier is the fresh pre-cutoff quote the batch prices against.
+    when = ms(2026, 10, 7, 19, 59, 55)
     led.mark_account(F, 1105 * U, 0, when, when)
-    settled = led.settle_month(F, '2026-10', ms(2026, 11, 2))
+    settled = led.settle_month(F, '2026-09', ms(2026, 10, 7, 20))
     assert settled['status'] == 'settled'
     assert settled['issued_external_shares_atoms'] == 100 * ATOMS
     final = led.status(F)

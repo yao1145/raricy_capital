@@ -1597,7 +1597,7 @@ function renderConfirmRows(reason) {
     const subscription = preview.subscription && typeof preview.subscription === "object"
       ? preview.subscription : null;
     rows.push(["关联申购单", textOf(pick(subscription || {}, "subscription_id", "id"), currentUnclaimedCandidate() || "未选择")]);
-    rows.push(["处理结果", "转为待确认申购；份额与资本流入仍由既有月末流程发行，净值不受影响"]);
+    rows.push(["处理结果", "转为待确认申购；份额与资本流入仍由既有结算批次发行，净值不受影响"]);
   } else {
     rows.push(["退款去向", `只退回原付款人 ${textOf(unclaimedPayer(record))}，金额 ${amount}，不能分期或改额`]);
     rows.push(["处理结果", "生成一笔付款队列（排队不等于已付款）；实际结果在本流水详情跟踪，未知结果需先对账"]);

@@ -22,9 +22,9 @@ def apply(led,kind,when,key='request'):
     return led.request_redemption(F,'holder',100*U,'ordinary',key,when)
 @pytest.mark.parametrize('kind',['subscription','redemption'])
 @pytest.mark.parametrize('when,period,deadline',[
-    (ms(1,1),'2026-01',ms(1,7,18)),
-    (ms(1,7,18),'2026-01',ms(1,7,18)),
-    (ms(2,1),'2026-02',ms(2,7,18)),
+    (ms(1,1),'2025-12',ms(1,7,18)),
+    (ms(1,7,18),'2025-12',ms(1,7,18)),
+    (ms(2,1),'2026-01',ms(2,7,18)),
 ])
 def test_open_at_month_start_and_includes_exact_deadline(ledger,kind,when,period,deadline):
     order=apply(ledger,kind,when)
@@ -49,13 +49,13 @@ def test_emergency_and_dividend_preferences_keep_original_dates(ledger):
     assert ledger.set_dividend_choice(F,'holder',0,ms(1,26))['effective_period']=='2026-02'
 def test_preexisting_received_order_keeps_recorded_payment_deadline(ledger):
     order=ledger.create_subscription(F,'investor',100*U,'legacy',ms(1,4))
-    order.update(deadline_ms=ms(1,25,18),occurred_ms=ms(1,20),status='received')
+    order.update(period='2026-01',deadline_ms=ms(1,25,18),occurred_ms=ms(1,20),status='received')
     ledger.store.put('subscriptions',order['id'],order)
     fund=ledger.store.get('funds',F)
     fund.update(pending_receipts_units=100*U,fee_balance_units=5*U)
     ledger.store.put('funds',F,fund)
-    cutoff=ms(1,31,23,59,55)
+    cutoff=ms(2,7,20)-5
     ledger.mark_account(F,1105*U,0,cutoff,cutoff)
-    result=ledger.settle_month(F,'2026-01',ms(2,1))
+    result=ledger.settle_month(F,'2026-01',ms(2,7,20)+5)
     assert result['issued_external_shares_atoms']==100*100000000
     assert ledger.status(F)['pending_receipts_units']==0

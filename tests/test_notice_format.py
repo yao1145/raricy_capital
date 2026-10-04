@@ -45,9 +45,11 @@ def test_month_dividend_notice_names_fish_not_units(tmp_path):
         # +100 realised, NAV 1.1000 -> eligible dividend 10 fish (0.01/share)
         led.trade_realized(F, 'nf-div', 100 * U, ms(2026, 1, 20))
         mark(led, 1100, ms(2026, 1, 20))
-        mark(led, 1100, ms(2026, 1, 31, 23, 59, 55))
+        # Period 2026-01 now settles at the 2026-02-07 20:00 batch, so the frozen
+        # valuation must be a fresh pre-cutoff quote (within the 15s age limit).
+        mark(led, 1100, ms(2026, 2, 7, 19, 59, 55))
 
-        r = led.settle_month(F, '2026-01', ms(2026, 2, 2))
+        r = led.settle_month(F, '2026-01', ms(2026, 2, 7, 20))
         assert r['status'] == 'settled'
         assert r['dividend_units'] == 10 * U          # still stored as integer units
 
@@ -115,7 +117,7 @@ def test_expired_receipt_refund_notice_shows_full_fish_amount(tmp_path):
         mark(led, 1000, t0)
         seed(led, 'inst', 1000, t0)
 
-        tsub = ms(2026, 1, 10)
+        tsub = ms(2026, 1, 5, 9)                       # inside the days 1-7 application window
         sub = led.create_subscription(F, 'u2', 100 * U, 'nf-late', tsub)
         r = led.receive_transfer(F, {
             'transfer_id': 'nf-late-tx', 'from_user_id': 'u2', 'amount_units': 105 * U,

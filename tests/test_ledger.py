@@ -54,8 +54,8 @@ def test_example_month_dividends_match_plan(led):
     # Month 1: +1000 realised, NAV 1.1000, dividend 100 -> ex-div 1.0900
     led.trade_realized(F, 't1', 1000 * U, ms(2026, 1, 20))
     mark(led, 11000, ms(2026, 1, 20))
-    mark(led, 11000, ms(2026, 1, 31, 23, 59, 55))
-    r1 = led.settle_month(F, '2026-01', ms(2026, 2, 2))
+    mark(led, 11000, ms(2026, 2, 7, 19, 59, 55))
+    r1 = led.settle_month(F, '2026-01', ms(2026, 2, 8))
     assert r1['status'] == 'settled'
     assert Decimal(r1['nav_before']) == Decimal('1.1')
     assert r1['dividend_units'] == 100 * U
@@ -66,8 +66,8 @@ def test_example_month_dividends_match_plan(led):
     # Month 2: -500, NAV 1.0400, benchmark 1.0900 -> no dividend
     led.trade_realized(F, 't2', -500 * U, ms(2026, 2, 20))
     mark(led, 10500, ms(2026, 2, 20))
-    mark(led, 10500, ms(2026, 2, 28, 23, 59, 55))
-    r2 = led.settle_month(F, '2026-02', ms(2026, 3, 2))
+    mark(led, 10500, ms(2026, 3, 7, 19, 59, 55))
+    r2 = led.settle_month(F, '2026-02', ms(2026, 3, 8))
     assert Decimal(r2['nav_before']) == Decimal('1.04')
     assert r2['dividend_units'] == 0
     assert Decimal(r2['benchmark_after']) == Decimal('1.09')
@@ -75,16 +75,16 @@ def test_example_month_dividends_match_plan(led):
     # Month 3: +300, NAV 1.0700 < benchmark -> still no dividend
     led.trade_realized(F, 't3', 300 * U, ms(2026, 3, 20))
     mark(led, 10800, ms(2026, 3, 20))
-    mark(led, 10800, ms(2026, 3, 31, 23, 59, 55))
-    r3 = led.settle_month(F, '2026-03', ms(2026, 4, 2))
+    mark(led, 10800, ms(2026, 4, 7, 19, 59, 55))
+    r3 = led.settle_month(F, '2026-03', ms(2026, 4, 8))
     assert Decimal(r3['nav_before']) == Decimal('1.07')
     assert r3['dividend_units'] == 0
 
     # Month 4: +400, NAV 1.1100; only the 0.0200 above benchmark is distributable
     led.trade_realized(F, 't4', 400 * U, ms(2026, 4, 20))
     mark(led, 11200, ms(2026, 4, 20))
-    mark(led, 11200, ms(2026, 4, 30, 23, 59, 55))
-    r4 = led.settle_month(F, '2026-04', ms(2026, 5, 2))
+    mark(led, 11200, ms(2026, 5, 7, 19, 59, 55))
+    r4 = led.settle_month(F, '2026-04', ms(2026, 5, 8))
     assert Decimal(r4['nav_before']) == Decimal('1.11')
     assert r4['distributable_units'] == 200 * U      # not the whole 400 profit
     assert r4['dividend_units'] == 20 * U
@@ -104,7 +104,7 @@ def test_settle_rejects_lookahead_and_stale_valuation(led):
     assert exc.value.code == 'month_not_ended'
 
     # No fresh pre-cutoff mark: settlement must hang rather than fake a month-end price.
-    r = led.settle_month(F, '2026-01', ms(2026, 2, 2))
+    r = led.settle_month(F, '2026-01', ms(2026, 2, 8))
     assert r['status'] == 'pending_valuation'
     assert r['reason'] == 'stale_valuation'
     assert led.notices(status='queued')
@@ -115,16 +115,17 @@ def test_post_cutoff_flow_cannot_distort_settlement(led):
     mark(led, 1000, t0)
     seed(led, 'inst', 1000, t0)
     led.trade_realized(F, 't1', 100 * U, ms(2026, 1, 6))
-    mark(led, 1100, ms(2026, 1, 31, 23, 59, 55))
+    mark(led, 1100, ms(2026, 2, 7, 19, 59, 55))
 
-    # A new subscription arrives on Feb 1, after the Jan cutoff, before settlement.
-    sub = led.create_subscription(F, 'u2', 500 * U, 'after-cutoff', ms(2026, 2, 1, 10))
+    # A new subscription ordered after the Jan cutoff (Feb 7, 20:00), before
+    # settlement, lands in the next period and cannot distort the frozen book.
+    sub = led.create_subscription(F, 'u2', 500 * U, 'after-cutoff', ms(2026, 3, 1, 10))
     led.receive_transfer(F, {
         'transfer_id': 'feb1', 'from_user_id': 'u2', 'amount_units': 525 * U,
-        'note': sub['payment_note'], 'occurred_ms': ms(2026, 2, 1, 10),
-    }, ms(2026, 2, 1, 10))
+        'note': sub['payment_note'], 'occurred_ms': ms(2026, 3, 1, 10),
+    }, ms(2026, 3, 1, 10))
 
-    r = led.settle_month(F, '2026-01', ms(2026, 2, 2))
+    r = led.settle_month(F, '2026-01', ms(2026, 3, 2))
     assert r['status'] == 'settled'
     # Registration was frozen at the cutoff: only the seeded holder exists.
     assert r['shares_at_cutoff_atoms'] == 1000 * ATOMS
@@ -190,9 +191,9 @@ def test_settlement_issues_external_shares_exactly_once(led):
         'transfer_id': 'tx3', 'from_user_id': 'u2', 'amount_units': 1050 * U,
         'note': sub['payment_note'], 'occurred_ms': tsub,
     }, tsub + 1000)
-    mark(led, 2050, ms(2026, 1, 31, 23, 59, 55))
+    mark(led, 2050, ms(2026, 2, 7, 19, 59, 55))
 
-    r = led.settle_month(F, '2026-01', ms(2026, 2, 2))
+    r = led.settle_month(F, '2026-01', ms(2026, 2, 8))
     assert r['issued_external_shares_atoms'] == 1000 * ATOMS
     st = led.status(F)
     assert st['pending_receipts_units'] == 0
@@ -201,7 +202,7 @@ def test_settlement_issues_external_shares_exactly_once(led):
     assert st['nav'] == '1.00000000'
     assert led.status(F, 'u2')['user_shares_atoms'] == 1000 * ATOMS
 
-    r2 = led.settle_month(F, '2026-01', ms(2026, 2, 3))
+    r2 = led.settle_month(F, '2026-01', ms(2026, 2, 9))
     assert r2 == r
     assert led.status(F)['shares_atoms'] == 2000 * ATOMS
 
@@ -242,8 +243,8 @@ def test_ordinary_redemption_20pct_gate_and_double_reservation(led):
         led.request_redemption(F, 'inst', 600 * U, 'ordinary', 'r2', ms(2026, 1, 6))
     assert exc.value.code == 'insufficient_shares'
 
-    mark(led, 1000, ms(2026, 1, 31, 23, 59, 55))
-    r = led.settle_month(F, '2026-01', ms(2026, 2, 2))
+    mark(led, 1000, ms(2026, 1, 7, 19, 59, 55))
+    r = led.settle_month(F, '2025-12', ms(2026, 1, 8))
     assert r['shares_at_cutoff_atoms'] == 1000 * ATOMS
     assert r['redeemed_shares_atoms'] == 200 * ATOMS      # 20% cap of old shares
     holder = led.holder(F, 'inst')
@@ -251,7 +252,7 @@ def test_ordinary_redemption_20pct_gate_and_double_reservation(led):
     assert holder['reserved_atoms'] == 300 * ATOMS        # remainder carried
     carried = led.store.get('redemptions', req['id'])
     assert carried['status'] == 'pending'
-    assert carried['period'] == '2026-02'
+    assert carried['period'] == '2026-01'
     payout = led.pending_payouts(F)[0]
     assert payout['kind'] == 'redemption'
     assert payout['amount_units'] == 200 * U
@@ -310,8 +311,8 @@ def test_dividend_reinvest_issues_shares_instead_of_cash(led):
 
     led.trade_realized(F, 't1', 100 * U, ms(2026, 1, 20))
     mark(led, 1100, ms(2026, 1, 20))
-    mark(led, 1100, ms(2026, 1, 31, 23, 59, 55))
-    r = led.settle_month(F, '2026-01', ms(2026, 2, 2))
+    mark(led, 1100, ms(2026, 2, 7, 19, 59, 55))
+    r = led.settle_month(F, '2026-01', ms(2026, 2, 8))
 
     assert r['cash_dividend_units'] == 0
     assert r['reinvest_value_units'] == 10 * U
@@ -375,9 +376,9 @@ def test_shareless_fund_issues_first_subscription_at_nav_one(led):
         'transfer_id': 'first-tx', 'from_user_id': 'u2', 'amount_units': 105 * U,
         'note': sub['payment_note'], 'occurred_ms': t,
     }, t + 1000)
-    mark(led, 105, ms(2026, 1, 31, 23, 59, 55))
+    mark(led, 105, ms(2026, 2, 7, 19, 59, 55))
 
-    r = led.settle_month(F, '2026-01', ms(2026, 2, 2))
+    r = led.settle_month(F, '2026-01', ms(2026, 2, 8))
     assert r['issued_external_shares_atoms'] == 100 * ATOMS
     st = led.status(F)
     assert st['shares_atoms'] == 100 * ATOMS
@@ -393,16 +394,16 @@ def test_month_profit_gate_blocks_losing_month_above_benchmark(led):
 
     # Month 1 is a pure mark gain: nothing is distributable (no realised profit)
     # and the benchmark stays at 1.0000 while month 2 starts at NAV 1.1000.
-    mark(led, 1100, ms(2026, 1, 31, 23, 59, 55))
-    r1 = led.settle_month(F, '2026-01', ms(2026, 2, 2))
+    mark(led, 1100, ms(2026, 2, 7, 19, 59, 55))
+    r1 = led.settle_month(F, '2026-01', ms(2026, 2, 8))
     assert r1['dividend_units'] == 0
     assert Decimal(led.status(F)['benchmark_nav']) == Decimal('1')
 
     # Month 2 loses 0.05 NAV but is still above the benchmark: R/H alone would pay
     # a dividend, the month's own negative investment profit must block it.
     led.trade_realized(F, 'm2', 50 * U, ms(2026, 2, 20))
-    mark(led, 1050, ms(2026, 2, 28, 23, 59, 55))
-    r2 = led.settle_month(F, '2026-02', ms(2026, 3, 2))
+    mark(led, 1050, ms(2026, 3, 7, 19, 59, 55))
+    r2 = led.settle_month(F, '2026-02', ms(2026, 3, 8))
     assert Decimal(r2['nav_before']) == Decimal('1.05')
     assert Decimal(r2['month_profit_per_share']) < 0
     assert r2['distributable_units'] == 0
@@ -414,14 +415,14 @@ def test_retriable_pending_period_completes_with_a_pre_cutoff_mark(led):
     mark(led, 1000, t0)
     seed(led, 'inst', 1000, t0)
 
-    first = led.settle_month(F, '2026-01', ms(2026, 2, 2))
+    first = led.settle_month(F, '2026-01', ms(2026, 2, 8))
     assert first['status'] == 'pending_valuation'
     assert len(led.notices(status='queued')) == 1
 
     # A late-delivered mark whose quote is genuinely pre-cutoff completes the
     # frozen valuation; the retry settles without a duplicate notice.
-    led.mark_account(F, 1100 * U, 0, ms(2026, 2, 2, 0, 30), ms(2026, 1, 31, 23, 59, 55))
-    again = led.settle_month(F, '2026-01', ms(2026, 2, 2, 1))
+    led.mark_account(F, 1100 * U, 0, ms(2026, 2, 8, 0, 30), ms(2026, 2, 7, 19, 59, 55))
+    again = led.settle_month(F, '2026-01', ms(2026, 2, 8, 1))
     assert again['status'] == 'settled'
     assert Decimal(again['nav_before']) == Decimal('1.1')
     assert len(led.notices(status='queued')) == 1
@@ -431,11 +432,11 @@ def test_post_cutoff_quote_cannot_price_the_month_end(led):
     t0 = ms(2026, 1, 5)
     mark(led, 1000, t0)
     seed(led, 'inst', 1000, t0)
-    assert led.settle_month(F, '2026-01', ms(2026, 2, 2))['status'] == 'pending_valuation'
+    assert led.settle_month(F, '2026-01', ms(2026, 2, 8))['status'] == 'pending_valuation'
 
     # A fresh *February* quote must never be used as the January cutoff price.
-    led.mark_account(F, 1200 * U, 0, ms(2026, 2, 2, 10), ms(2026, 2, 2, 10))
-    r = led.settle_month(F, '2026-01', ms(2026, 2, 2, 11))
+    led.mark_account(F, 1200 * U, 0, ms(2026, 2, 8, 10), ms(2026, 2, 8, 10))
+    r = led.settle_month(F, '2026-01', ms(2026, 2, 8, 11))
     assert r['status'] == 'pending_valuation'
     assert r['reason'] == 'stale_valuation'
 
@@ -580,10 +581,10 @@ def test_cancel_refuses_crossed_deadline_and_settled_orders(led):
         'transfer_id': 'tx-set', 'from_user_id': 'u2', 'amount_units': 105 * U,
         'note': sub['payment_note'], 'occurred_ms': t,
     }, t + 1000)
-    mark(led, 1105, ms(2026, 1, 31, 23, 59, 55))
-    led.settle_month(F, '2026-01', ms(2026, 2, 2))
+    mark(led, 1105, ms(2026, 2, 7, 19, 59, 55))
+    led.settle_month(F, '2026-01', ms(2026, 2, 8))
     with pytest.raises(FundError) as exc:
-        led.cancel_order(F, 'u2', sub['id'], ms(2026, 2, 2, 1))
+        led.cancel_order(F, 'u2', sub['id'], ms(2026, 2, 8, 1))
     assert exc.value.code == 'order_settled'
     assert led.status(F, 'u2')['user_shares_atoms'] == 100 * ATOMS
 
@@ -603,21 +604,21 @@ def test_dividend_choice_deadline_binds_to_period(led):
     # January: +100 realised, NAV 1.1000, dividend 100; the in-time 25% choice
     # applies even though a later choice already exists.
     led.trade_realized(F, 'dj1', 100 * U, ms(2026, 1, 20))
-    mark(led, 1100, ms(2026, 1, 31, 23, 59, 55))
-    jan = led.settle_month(F, '2026-01', ms(2026, 2, 2))
+    mark(led, 1100, ms(2026, 2, 7, 19, 59, 55))
+    jan = led.settle_month(F, '2026-01', ms(2026, 2, 8))
     assert jan['status'] == 'settled'
     assert jan['dividend_units'] == 10 * U
     assert jan['reinvest_value_units'] == 25_000        # 25% of 10*U
     assert jan['cash_dividend_units'] == 75_000
 
     # Replaying the settled month cannot be rewritten by the February choice.
-    replay = led.settle_month(F, '2026-01', ms(2026, 2, 3))
+    replay = led.settle_month(F, '2026-01', ms(2026, 2, 9))
     assert replay == jan
 
     # February now uses the full-reinvest choice set after January's deadline.
     led.trade_realized(F, 'dj2', 200 * U, ms(2026, 2, 20))
-    mark(led, 1400, ms(2026, 2, 28, 23, 59, 55))
-    feb = led.settle_month(F, '2026-02', ms(2026, 3, 2))
+    mark(led, 1400, ms(2026, 3, 7, 19, 59, 55))
+    feb = led.settle_month(F, '2026-02', ms(2026, 3, 8))
     assert feb['status'] == 'settled'
     assert feb['cash_dividend_units'] == 0
     assert feb['reinvest_value_units'] == feb['dividend_units'] > 0
@@ -652,14 +653,14 @@ def test_dividend_choice_after_month_end_cannot_rewrite_delayed_period(led):
     led.trade_realized(F, 'dly1', 100 * U, ms(2026, 1, 20))
 
     # January hangs on a stale valuation; its applicable choice is already fixed.
-    first = led.settle_month(F, '2026-01', ms(2026, 2, 2))
+    first = led.settle_month(F, '2026-01', ms(2026, 2, 8))
     assert first['status'] == 'pending_valuation'
 
     # A revision after month-end but before the delayed settlement only governs
     # February onward and must not rewrite January.
-    led.set_dividend_choice(F, 'inst', 1, ms(2026, 2, 1))
-    led.mark_account(F, 1100 * U, 0, ms(2026, 2, 2, 0, 30), ms(2026, 1, 31, 23, 59, 55))
-    jan = led.settle_month(F, '2026-01', ms(2026, 2, 2, 1))
+    led.set_dividend_choice(F, 'inst', 1, ms(2026, 2, 8, 0, 15))
+    led.mark_account(F, 1100 * U, 0, ms(2026, 2, 8, 0, 30), ms(2026, 2, 7, 19, 59, 55))
+    jan = led.settle_month(F, '2026-01', ms(2026, 2, 8, 1))
     assert jan['status'] == 'settled'
     assert jan['reinvest_value_units'] == 5 * U
     assert jan['cash_dividend_units'] == 5 * U
@@ -730,8 +731,8 @@ def test_carried_ordinary_remainder_gets_next_deadline_and_cancel_keeps_confirme
     mark(led, 1000, ms(2026, 1, 6))
     req = led.request_redemption(F, 'inst', 1000 * U, 'ordinary', 'carry1', ms(2026, 1, 6))
 
-    mark(led, 1000, ms(2026, 1, 31, 23, 59, 55))
-    r = led.settle_month(F, '2026-01', ms(2026, 2, 2))
+    mark(led, 1000, ms(2026, 1, 7, 19, 59, 55))
+    r = led.settle_month(F, '2025-12', ms(2026, 1, 8))
     assert r['redeemed_shares_atoms'] == 200 * ATOMS    # 20% cap of the 1000 old shares
 
     carried = led.store.get('redemptions', req['id'])
@@ -740,8 +741,8 @@ def test_carried_ordinary_remainder_gets_next_deadline_and_cancel_keeps_confirme
     assert carried['shares_reserved_atoms'] == 800 * ATOMS
     # §6.4 lets the deferred part be withdrawn: it carries the next period's own
     # 7th 18:00 deadline, with period and batch kept consistent.
-    assert carried['period'] == '2026-02'
-    assert carried['batch'] == '2026-02'
+    assert carried['period'] == '2026-01'
+    assert carried['batch'] == '2026-01'
     assert carried['deadline_ms'] == ms(2026, 2, 7, 18)
     payout = led.pending_payouts(F)[0]
     assert payout['kind'] == 'redemption' and payout['amount_units'] == 200 * U
@@ -765,7 +766,7 @@ def test_subscription_paid_just_after_window_rolls_period_and_stays_cancellable(
     seed(led, 'inst', 1000, t0)
     created = ms(2026, 1, 7, 17, 59, 30)
     sub = led.create_subscription(F, 'u2', 100 * U, 'rollsub', created)
-    assert sub['period'] == '2026-01'
+    assert sub['period'] == '2025-12'
     assert sub['deadline_ms'] == ms(2026, 1, 7, 18)
 
     occurred = ms(2026, 1, 7, 18, 0, 30)
@@ -778,7 +779,7 @@ def test_subscription_paid_just_after_window_rolls_period_and_stays_cancellable(
     assert r['status'] == 'received'
     stored = led.store.get('subscriptions', sub['id'])
     assert stored['occurred_ms'] == occurred            # authority is arrival time
-    assert stored['period'] == '2026-02'                # issuance rolls forward
+    assert stored['period'] == '2026-01'                # issuance rolls forward
     assert stored['deadline_ms'] == ms(2026, 2, 7, 18)
 
     rollover = [n for n in led.notices() if n['id'].startswith('sub-rollover:')]
@@ -812,10 +813,10 @@ def test_cash_short_dividend_defers_with_one_stable_notice(led):
     led.trade_realized(F, 'cs-div', 100 * U, ms(2026, 1, 20))
     # Equity 1100 but only 5 of it is spendable cash: the dividend is eligible yet
     # cannot be paid alongside the (here empty) confirmed queue.
-    led.mark_account(F, 5 * U, 1095 * U, ms(2026, 1, 31, 23, 59, 55),
-                     ms(2026, 1, 31, 23, 59, 55))
+    led.mark_account(F, 5 * U, 1095 * U, ms(2026, 2, 7, 19, 59, 55),
+                     ms(2026, 2, 7, 19, 59, 55))
 
-    r = led.settle_month(F, '2026-01', ms(2026, 2, 2))
+    r = led.settle_month(F, '2026-01', ms(2026, 2, 8))
     assert r['distributable_units'] == 100 * U          # otherwise eligible
     assert r['planned_dividend_units'] == 0
     assert r['dividend_units'] == 0
@@ -825,7 +826,7 @@ def test_cash_short_dividend_defers_with_one_stable_notice(led):
     assert '现金' in msgs[0]['content'] and '2026-01' in msgs[0]['content']
     assert led.pending_payouts(F) == []                 # nothing booked for the dividend
 
-    replay = led.settle_month(F, '2026-01', ms(2026, 2, 3))
+    replay = led.settle_month(F, '2026-01', ms(2026, 2, 9))
     assert replay == r
     assert len([n for n in led.notices() if n['id'] == key]) == 1
 
@@ -836,10 +837,10 @@ def test_cash_short_redemption_scaling_notice_stable_and_amount_unchanged(led):
     seed(led, 'inst', 1000, t0)
     led.mark_account(F, 100 * U, 900 * U, ms(2026, 1, 6), ms(2026, 1, 6))
     req = led.request_redemption(F, 'inst', 500 * U, 'ordinary', 'cs-red', ms(2026, 1, 6))
-    led.mark_account(F, 100 * U, 900 * U, ms(2026, 1, 31, 23, 59, 55),
-                     ms(2026, 1, 31, 23, 59, 55))
+    led.mark_account(F, 100 * U, 900 * U, ms(2026, 1, 7, 19, 59, 55),
+                     ms(2026, 1, 7, 19, 59, 55))
 
-    r = led.settle_month(F, '2026-01', ms(2026, 2, 2))
+    r = led.settle_month(F, '2025-12', ms(2026, 1, 8))
     # 20% cap confirms 200 shares, then the 100 of cash scales that to 100 shares.
     assert r['redeemed_shares_atoms'] == 100 * ATOMS
     assert r['redeem_value_units'] == 100 * U
@@ -847,16 +848,16 @@ def test_cash_short_redemption_scaling_notice_stable_and_amount_unchanged(led):
     assert carried['cash_scaled'] is True
     assert carried['shares_confirmed_atoms'] == 100 * ATOMS
     assert carried['shares_reserved_atoms'] == 400 * ATOMS
-    assert carried['period'] == '2026-02' and carried['batch'] == '2026-02'
+    assert carried['period'] == '2026-01' and carried['batch'] == '2026-01'
     assert carried['deadline_ms'] == ms(2026, 2, 7, 18)
 
-    key = f'settle-redeem-short:{F}:2026-01:{req["id"]}'
+    key = f'settle-redeem-short:{F}:2025-12:{req["id"]}'
     msgs = [n for n in led.notices() if n['id'] == key]
     assert len(msgs) == 1 and msgs[0]['user_id'] == 'inst'
     assert '现金' in msgs[0]['content'] and '顺延' in msgs[0]['content']
     assert [p['amount_units'] for p in led.pending_payouts(F)] == [100 * U]
 
-    replay = led.settle_month(F, '2026-01', ms(2026, 2, 3))
+    replay = led.settle_month(F, '2025-12', ms(2026, 1, 9))
     assert replay == r
     assert len([n for n in led.notices() if n['id'] == key]) == 1
     assert [p['amount_units'] for p in led.pending_payouts(F)] == [100 * U]
@@ -869,36 +870,36 @@ def test_cash_short_redemption_notice_carries_period_across_months(led):
     seed(led, 'inst', 1000, t0)
     led.mark_account(F, 100 * U, 900 * U, ms(2026, 1, 6), ms(2026, 1, 6))
     req = led.request_redemption(F, 'inst', 500 * U, 'ordinary', 'cs-multi', ms(2026, 1, 6))
-    led.mark_account(F, 100 * U, 900 * U, ms(2026, 1, 31, 23, 59, 55),
-                     ms(2026, 1, 31, 23, 59, 55))
+    led.mark_account(F, 100 * U, 900 * U, ms(2026, 1, 7, 19, 59, 55),
+                     ms(2026, 1, 7, 19, 59, 55))
 
-    jan = led.settle_month(F, '2026-01', ms(2026, 2, 2))
+    jan = led.settle_month(F, '2025-12', ms(2026, 1, 8))
     assert jan['redeemed_shares_atoms'] == 100 * ATOMS
-    jan_key = f'settle-redeem-short:{F}:2026-01:{req["id"]}'
+    jan_key = f'settle-redeem-short:{F}:2025-12:{req["id"]}'
     jan_notice = led.store.get('notices', jan_key)
-    assert jan_notice is not None and '2026-01' in jan_notice['content']
+    assert jan_notice is not None and '2025-12' in jan_notice['content']
     payout = led.pending_payouts(F)[0]
     assert payout['amount_units'] == 100 * U
-    led.mark_payout_paid(payout['id'], 'tx-jan', ms(2026, 2, 5))
+    led.mark_payout_paid(payout['id'], 'tx-jan', ms(2026, 1, 10))
 
-    # February is cash-short again for the same carried remainder, so a distinct
-    # notice keyed by the *February* period must be produced.
-    led.mark_account(F, 50 * U, 950 * U, ms(2026, 2, 28, 23, 59, 55),
-                     ms(2026, 2, 28, 23, 59, 55))
-    feb = led.settle_month(F, '2026-02', ms(2026, 3, 2))
+    # The next period is cash-short again for the same carried remainder, so a
+    # distinct notice keyed by that period must be produced.
+    led.mark_account(F, 50 * U, 950 * U, ms(2026, 2, 7, 19, 59, 55),
+                     ms(2026, 2, 7, 19, 59, 55))
+    feb = led.settle_month(F, '2026-01', ms(2026, 2, 8))
     carried = led.store.get('redemptions', req['id'])
     assert carried['cash_scaled'] is True
     assert carried['shares_confirmed_atoms'] > 0
     assert carried['shares_reserved_atoms'] > 0
-    assert carried['period'] == '2026-03'
-    feb_key = f'settle-redeem-short:{F}:2026-02:{req["id"]}'
+    assert carried['period'] == '2026-02'
+    feb_key = f'settle-redeem-short:{F}:2026-01:{req["id"]}'
     assert feb_key != jan_key
     feb_notice = led.store.get('notices', feb_key)
-    assert feb_notice is not None and '2026-02' in feb_notice['content']
+    assert feb_notice is not None and '2026-01' in feb_notice['content']
     assert led.store.get('notices', jan_key)['content'] == jan_notice['content']
-    # Replaying February produces no third notice and no extra payout.
+    # Replaying this period produces no third notice and no extra payout.
     payouts_before = len(led.pending_payouts(F))
-    assert led.settle_month(F, '2026-02', ms(2026, 3, 3)) == feb
+    assert led.settle_month(F, '2026-01', ms(2026, 2, 9)) == feb
     assert led.store.get('notices', feb_key) is not None
     assert len(led.pending_payouts(F)) == payouts_before
     assert feb['redeemed_shares_atoms'] > 0
@@ -913,8 +914,8 @@ def test_retained_emergency_fee_does_not_create_a_positive_investment_month(led)
 
     # January is a pure mark gain: no realised profit, so no dividend; the
     # benchmark stays 1.0 while February starts at NAV 1.05.
-    mark(led, 2100, ms(2026, 1, 31, 23, 59, 55))
-    jan = led.settle_month(F, '2026-01', ms(2026, 2, 2))
+    mark(led, 2100, ms(2026, 2, 7, 19, 59, 55))
+    jan = led.settle_month(F, '2026-01', ms(2026, 2, 8))
     assert jan['dividend_units'] == 0
     assert Decimal(led.status(F)['period_start_nav']) == Decimal('1.05')
 
@@ -939,8 +940,8 @@ def test_retained_emergency_fee_does_not_create_a_positive_investment_month(led)
     assert Decimal(st['benchmark_nav']) == Decimal('1.1005')
     assert Decimal(st['period_start_nav']) == Decimal('1.1505')
 
-    mark(led, 2010, ms(2026, 2, 28, 23, 59, 55))
-    feb = led.settle_month(F, '2026-02', ms(2026, 3, 2))
+    mark(led, 2010, ms(2026, 3, 7, 19, 59, 55))
+    feb = led.settle_month(F, '2026-02', ms(2026, 3, 8))
     assert Decimal(feb['nav_before']) == Decimal('1.1055')
     # The fee uplift is excluded from the month's own profit, so the losing month
     # cannot gate a dividend through the benchmark test.
@@ -957,8 +958,8 @@ def test_cancel_unexecuted_ordinary_redemption_when_period_pending_valuation(led
     led.mark_account(F, 1000 * U, 0, ms(2026, 1, 6), ms(2026, 1, 6))
     req = led.request_redemption(F, 'inst', 500 * U, 'ordinary', 'pv-red', ms(2026, 1, 6))
 
-    # No genuinely pre-cutoff month-end quote: January stays unpriceable.
-    pending = led.settle_month(F, '2026-01', ms(2026, 2, 2))
+    # No genuinely pre-cutoff cutoff quote: the period stays unpriceable.
+    pending = led.settle_month(F, '2025-12', ms(2026, 1, 8))
     assert pending['status'] == 'pending_valuation'
     assert pending['reason'] == 'stale_valuation'
     assert led.pending_payouts(F) == []
@@ -973,8 +974,8 @@ def test_cancel_unexecuted_ordinary_redemption_when_period_pending_valuation(led
     assert out['shares_confirmed_atoms'] == 0       # nothing was confirmed
     assert led.pending_payouts(F) == []             # and nothing paid
     # A healthy month still enforces its own deadline.
-    assert led._period_pending_valuation(F, '2026-01') is True
-    assert led._period_pending_valuation(F, '2026-02') is False
+    assert led._period_pending_valuation(F, '2025-12') is True
+    assert led._period_pending_valuation(F, '2026-01') is False
 
 
 def test_pending_valuation_cancel_keeps_confirmed_shares_and_past_payout(led):
@@ -983,15 +984,15 @@ def test_pending_valuation_cancel_keeps_confirmed_shares_and_past_payout(led):
     seed(led, 'inst', 1000, t0)
     led.mark_account(F, 100 * U, 900 * U, ms(2026, 1, 6), ms(2026, 1, 6))
     req = led.request_redemption(F, 'inst', 500 * U, 'ordinary', 'pv-carry', ms(2026, 1, 6))
-    led.mark_account(F, 100 * U, 900 * U, ms(2026, 1, 31, 23, 59, 55),
-                     ms(2026, 1, 31, 23, 59, 55))
+    led.mark_account(F, 100 * U, 900 * U, ms(2026, 1, 7, 19, 59, 55),
+                     ms(2026, 1, 7, 19, 59, 55))
 
-    jan = led.settle_month(F, '2026-01', ms(2026, 2, 2))
+    jan = led.settle_month(F, '2025-12', ms(2026, 1, 8))
     assert jan['redeemed_shares_atoms'] == 100 * ATOMS
     payout = led.pending_payouts(F)[0]
 
-    # The carried remainder's February is unpriceable too.
-    feb = led.settle_month(F, '2026-02', ms(2026, 3, 2))
+    # The carried remainder's next period is unpriceable too.
+    feb = led.settle_month(F, '2026-01', ms(2026, 2, 8))
     assert feb['status'] == 'pending_valuation'
 
     out = led.cancel_order(F, 'inst', req['id'], ms(2026, 3, 10))
@@ -1019,7 +1020,7 @@ def test_received_subscription_refunded_once_while_period_pending_valuation(led)
     assert received['status'] == 'received'
     mark(led, 1105, tsub + 2000)
 
-    pending = led.settle_month(F, '2026-01', ms(2026, 2, 2))
+    pending = led.settle_month(F, '2025-12', ms(2026, 1, 8))
     assert pending['status'] == 'pending_valuation'
 
     # Paid but unissued, and its month cannot be priced: refund principal + fee

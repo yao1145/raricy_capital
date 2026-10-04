@@ -39,9 +39,14 @@ def incoming(led, user='investor', amount=105, note=None, tid='in-1', when=T+100
     return order,tx,receipt
 
 def settle(led):
-    cutoff = ms(10,31,23,59,55)
-    led.mark_account(F,led.status(F)['wallet_units'],0,cutoff,cutoff)
-    return led.settle_month(F,'2026-10',ms(11,1,0))
+    # The order created at ``T`` belongs to period ``2026-09``: its window is the
+    # 1st-7th of the following month (closing 2026-10-07 18:00) and its batch
+    # settles 2026-10-07 20:00.  Record the last pre-cutoff quote, then settle
+    # just after the batch.
+    quote = ms(10,7,19,59,55)
+    now = ms(10,8,12)
+    led.mark_account(F,led.status(F)['wallet_units'],0,now,quote)
+    return led.settle_month(F,'2026-09',now)
 
 def test_control_subscription_has_zero_fee_but_others_pay_five_percent(ledger):
     own=ledger.create_subscription(F,C,100*U,'own',T)
@@ -73,7 +78,7 @@ def test_control_order_is_matched_without_expiry_refund(ledger):
 
 def test_control_capital_after_monthly_window_rolls_forward(ledger):
     _,_,receipt=incoming(ledger,C,100,note='本金',when=ms(10,8))
-    assert ledger.store.get('subscriptions',receipt['subscription_id'])['period']=='2026-11'
+    assert ledger.store.get('subscriptions',receipt['subscription_id'])['period']=='2026-10'
     settle(ledger)
     assert ledger.status(F)['pending_receipts_units']==100*U
 
@@ -109,8 +114,8 @@ def test_first_issuance_also_queues_fee(tmp_path):
         order=led.create_subscription(F,'investor',100*U,'first',T)
         led.receive_transfer(F,{'transfer_id':'first-in','from_user_id':'investor',
             'amount_units':105*U,'note':order['payment_note'],'occurred_ms':T+1},T+2)
-        led.mark_account(F,105*U,0,ms(10,31,23,59,55),ms(10,31,23,59,55))
-        led.settle_month(F,'2026-10',ms(11,1,0))
+        led.mark_account(F,105*U,0,ms(10,8,12),ms(10,7,19,59,55))
+        led.settle_month(F,'2026-09',ms(10,8,12))
         assert led.status(F)['equity_units']==100*U
         assert len(store.list('payouts'))==1
     finally:store.close()

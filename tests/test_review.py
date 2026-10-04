@@ -33,14 +33,14 @@ def assert_shares(led):
     assert all(0<=h['reserved_atoms']<=h['shares_atoms'] for h in holders)
 
 def test_expired_locally_timely_receipt_still_accepted(led):
-    t=ms(1,10)
+    t=ms(1,5)
     sub=led.create_subscription(F,'u',100*U,'review',t)
     led.expire_subscriptions(t+200000)
     result=paid(led,sub,t+30000,t+201000)
     assert result['status']=='received'
 
 def test_expired_locally_late_receipt_full_refund(led):
-    t=ms(1,10)
+    t=ms(1,5)
     sub=led.create_subscription(F,'u',100*U,'review',t)
     led.expire_subscriptions(t+200000)
     result=paid(led,sub,t+190000,t+201000)
@@ -48,35 +48,35 @@ def test_expired_locally_late_receipt_full_refund(led):
     assert led.pending_payouts(F)[0]['amount_units']==105*U
 
 def test_external_subscription_shares_conserved_and_nav_flat(led):
-    t=ms(1,10)
+    t=ms(2,5)
     sub=led.create_subscription(F,'u',1000*U,'review',t)
     paid(led,sub,t+30000,t+31000)
-    end=ms(1,31,23,59,55)
+    end=ms(2,7,19,59,55)
     led.mark_account(F,2050*U,0,end,end)
-    led.settle_month(F,'2026-01',ms(2,1))
+    led.settle_month(F,'2026-01',ms(2,8))
     assert_shares(led)
     assert led.status(F)['nav']=='1.00000000'
     assert led.status(F)['shares_atoms']==2000*A
 
 def test_monthly_gate_preserves_reserved_remainder(led):
-    t=ms(1,10)
+    t=ms(2,5)
     led.mark_account(F,1000*U,0,t,t)
     led.request_redemption(F,'sponsor',1000*U,'ordinary','review',t)
-    end=ms(1,31,23,59,55)
+    end=ms(2,7,19,59,55)
     led.mark_account(F,1000*U,0,end,end)
-    led.settle_month(F,'2026-01',ms(2,1))
+    led.settle_month(F,'2026-01',ms(2,8))
     assert_shares(led)
     holder=led.holder(F,'sponsor')
     assert holder['shares_atoms']==800*A
     assert holder['reserved_atoms']==800*A
 
 def test_subscription_after_window_not_issued_this_month(led):
-    t=ms(1,26)
+    t=ms(2,7,18)
     sub=led.create_subscription(F,'u',100*U,'review',t)
     paid(led,sub,t+30000,t+31000)
-    end=ms(1,31,23,59,55)
+    end=ms(2,7,19,59,55)
     led.mark_account(F,1105*U,0,end,end)
-    result=led.settle_month(F,'2026-01',ms(2,1))
+    result=led.settle_month(F,'2026-01',ms(2,8))
     assert result['issued_external_shares_atoms']==0
     assert led.status(F)['pending_receipts_units']==100*U
 
