@@ -12,43 +12,60 @@
 <header class="topbar">
   <div class="brand">
     <span class="mark" aria-hidden="true"></span>
-    <div>
+    <div class="brand-text">
       <h1>双基金运营台</h1>
       <p class="sub" id="brand-sub">小鱼干 · 温和增长 / 激进增长</p>
     </div>
   </div>
   <div class="top-actions">
-    <span class="badge" id="live-badge" data-state="unknown">连接未知</span>
-    <span class="badge" id="net-badge" data-state="unknown">网络未知</span>
-    <button type="button" class="btn ghost" id="refresh-btn">刷新</button>
-    <button type="button" class="btn ghost" id="backup-btn">备份</button>
-    <button type="button" class="btn ghost" id="logout-btn" hidden>退出</button>
+    <div class="status-pills" id="status-pills" hidden>
+      <span class="badge" id="live-badge" data-state="unknown">模式未知</span>
+      <span class="badge" id="net-badge" data-state="unknown">网络未知</span>
+    </div>
+    <button type="button" class="btn ghost" id="refresh-btn" hidden>刷新</button>
+    <button type="button" class="btn ghost" id="backup-btn" hidden>备份</button>
+    <button type="button" class="btn ghost" id="logout-btn" hidden>退出登录</button>
   </div>
 </header>
 
 <section id="login-panel" class="login-panel" hidden>
   <form id="login-form" class="card login-card" autocomplete="off">
-    <h2>管理令牌登录</h2>
-    <p class="hint">令牌仅随本次请求提交，浏览器不保存明文，只保留短期本地会话 Cookie。</p>
+    <div class="login-head">
+      <span class="mark small" aria-hidden="true"></span>
+      <div>
+        <h2>管理令牌登录</h2>
+        <p class="hint">仅本机访问，令牌只随本次请求提交。</p>
+      </div>
+    </div>
     <label class="field">
       <span>控制令牌</span>
       <input type="password" id="login-token" name="token" autocomplete="current-password" required>
     </label>
     <button type="submit" class="btn primary">进入控制台</button>
-    <p class="error" id="login-error" hidden></p>
+    <p class="hint">浏览器不保存明文令牌，只保留短期本地会话 Cookie；未登录时不会加载任何运营数据。</p>
+    <p class="error" id="login-error" role="alert" hidden></p>
   </form>
 </section>
 
 <main id="console" hidden>
-  <section class="banner" id="status-banner"></section>
+  <section class="dash-head" aria-labelledby="dash-title">
+    <div>
+      <h2 id="dash-title">运营总览</h2>
+      <p class="dash-sub">掌握净值变化，查看资金流向与运行状态。</p>
+    </div>
+    <p class="session-note" id="session-note">管理会话已登录 · 数据每 5 秒刷新</p>
+  </section>
 
-  <section class="funds" id="funds"></section>
+  <section class="banner" id="status-banner" aria-label="运行状态摘要"></section>
+
+  <section class="funds" id="funds" aria-label="基金列表"></section>
 
   <section class="panels">
     <div class="card panel">
       <header class="panel-head">
         <h2>运行日志 / 事件</h2>
         <div class="panel-tools">
+          <label class="sr-only" for="event-filter">按基金筛选事件</label>
           <select id="event-filter">
             <option value="">全部基金</option>
           </select>
@@ -92,13 +109,25 @@
       <p class="empty" data-field="nav-empty" hidden>暂无净值记录</p>
     </div>
 
-    <dl class="metrics" data-field="metrics"></dl>
+    <ul class="status-lines">
+      <li class="status-line" data-field="account-status" data-tone="unknown">站点账户：状态未知</li>
+      <li class="status-line" data-field="settlement-status" data-tone="unknown">结算：状态未知</li>
+    </ul>
+
+    <dl class="metrics metrics-primary" data-field="metrics"></dl>
+
+    <details class="subsection">
+      <summary>账务与对账明细</summary>
+      <dl class="metrics metrics-secondary" data-field="metrics-secondary"></dl>
+    </details>
 
     <details class="subsection">
       <summary>份额持有人</summary>
       <ul class="holders" data-field="holders"></ul>
     </details>
 
+    <details class="subsection fund-actions">
+      <summary>基金操作</summary>
     <div class="controls">
       <details class="subsection">
         <summary>登录站点账户</summary>
@@ -143,6 +172,7 @@
         </form>
       </details>
     </div>
+    </details>
     <p class="feedback" data-field="feedback" hidden></p>
   </article>
 </template>

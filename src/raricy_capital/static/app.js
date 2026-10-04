@@ -6,9 +6,23 @@
 
 const MONEY_SCALE = 10000;      // 1e-4 fish-credit units
 const SHARE_SCALE = 100000000;  // 1e-8 share atoms
+const POLL_MS = 5000;
 
 const el = (id) => document.getElementById(id);
-const state = { authenticated: false, funds: [], filter: "" };
+const state = { authenticated: false, funds: [], filter: "", lastStatus: null };
+
+//: Bumped whenever the operator signs in or out. An async load that captured an
+//: older epoch must not paint results or re-open the console after a logout.
+let sessionEpoch = 0;
+
+//: Coalesces refreshes: never run two overlapping refresh cycles, but re-run once
+//: when an action asked for fresher data while a cycle was already in flight.
+let refreshPromise = null;
+let refreshQueued = false;
+let refreshQueuedFull = false;
+let pollTimer = null;
+
+const DEFAULT_NOTE = "管理会话已登录 · 数据每 5 秒刷新";
 
 // ------------------------------------------------------------- formatting
 
@@ -58,7 +72,7 @@ function stateBadge(fund) {
   if (trader) {
     const phase = String(trader.phase || "").toLowerCase();
     if (phase === "halted") return ["bad", "永久停机"];
-    if (phase === "stopped") return ["warn", "已停机"];
+    if (phase === "stopped") return ["warn", fund.logged_in && Number(fund.shares_atoms) > 0 ? "已暂停" : "未启用"];
     if (phase === "daily_pause" || phase.includes("pause")) return ["warn", "日内暂停"];
     if (phase === "blocked" || trader.blocked) return ["warn", "受限"];
     if (phase === "holding") return ["ok", "持仓中"];
@@ -72,9 +86,65 @@ function stateBadge(fund) {
   return ["unknown", "状态未知"];
 }
 
+//: Per-fund account connection state reported by the service
+//: (`fund.account.state`): logged_in / relogin_required / retrying / no_credentials.
+function accountStatusLine(fund) {
+  const account = fund.account && typeof fund.account === "object" ? fund.account : null;
+  const code = account && account.error ? String(account.error) : "";
+  if (account) {
+    const accountState = String(account.state || "").toLowerCase();
+    if (accountState === "logged_in") return ["ok", "站点账户：已登录"];
+    if (accountState === "relogin_required") {
+      return ["bad", `站点账户：需人工重新登录${code ? `（${code}）` : ""}`];
+    }
+    if (accountState === "retrying") {
+      const bits = ["站点账户：连接失败，等待自动重试"];
+      if (code) bits.push(`原因 ${code}`);
+      const attempts = Number(account.attempts);
+      if (Number.isFinite(attempts) && attempts > 0) bits.push(`已尝试 ${attempts} 次`);
+      const waitMs = Number(account.retry_in_ms);
+      if (Number.isFinite(waitMs) && waitMs > 0) bits.push(`约 ${Math.ceil(waitMs / 1000)} 秒后重试`);
+      else if (account.retry_in_ms === null) bits.push("已停止自动重试");
+      return ["warn", bits.join(" · ")];
+    }
+    if (accountState === "no_credentials") return ["warn", "站点账户：未配置凭据，等待人工登录"];
+    if (accountState) return ["unknown", `站点账户：未知状态（${accountState}）`];
+  }
+  if (fund.logged_in === true) return ["ok", "站点账户：已登录"];
+  if (fund.logged_in === false) return ["warn", "站点账户：未登录"];
+  return ["unknown", "站点账户：状态未知"];
+}
+
+//: Settlement view from `fund.settlement` ({hold, period, reason, pending[]}).
+function settlementStatusLine(fund) {
+  const settlement = fund.settlement && typeof fund.settlement === "object" ? fund.settlement : null;
+  if (!settlement) return ["unknown", "结算：状态未知"];
+  const pending = Array.isArray(settlement.pending)
+    ? settlement.pending.filter((row) => row && row.period)
+    : [];
+  const pendingText = pending
+    .map((row) => `${row.period}（${row.status || "未结算"}）`)
+    .join("、");
+  if (settlement.hold) {
+    const bits = [settlement.period ? `${settlement.period} 估值未完成` : "估值未完成"];
+    if (settlement.reason) bits.push(`原因 ${settlement.reason}`);
+    if (pendingText) bits.push(`待处理 ${pendingText}`);
+    return ["warn", `结算暂停：${bits.join(" · ")}`];
+  }
+  if (pendingText) return ["warn", `待处理结算：${pendingText}`];
+  return ["ok", "结算：无待处理期间"];
+}
+
+function setStatusLine(node, [tone, text]) {
+  if (!node) return;
+  node.dataset.tone = tone;
+  if (node.textContent !== text) node.textContent = text;
+}
+
 // --------------------------------------------------------------- api layer
 
 async function api(path, options = {}) {
+  const requestEpoch = sessionEpoch;
   const opts = {
     method: options.method || "GET",
     credentials: "same-origin",
@@ -91,7 +161,7 @@ async function api(path, options = {}) {
     try { data = JSON.parse(text); } catch (err) { data = null; }
   }
   if (response.status === 401) {
-    showLogin();
+    if (requestEpoch === sessionEpoch) showLogin();
     throw new Error("unauthorized");
   }
   if (!response.ok) {
@@ -103,23 +173,93 @@ async function api(path, options = {}) {
 
 // ---------------------------------------------------------------- login ui
 
+function setHidden(id, hidden) {
+  const node = el(id);
+  if (node) node.hidden = hidden;
+}
+
+function clearConsoleData() {
+  const funds = el("funds");
+  if (funds) funds.replaceChildren();
+  for (const id of ["events-list", "orders-list"]) {
+    const list = el(id);
+    if (list) list.replaceChildren();
+  }
+  const banner = el("status-banner");
+  if (banner) {
+    banner.replaceChildren();
+    banner.classList.add("empty");
+  }
+  state.funds = [];
+  state.lastStatus = null;
+  updateFilterOptions([]);
+}
+
 function showLogin() {
+  sessionEpoch += 1;
   state.authenticated = false;
-  el("login-panel").hidden = false;
-  el("console").hidden = true;
-  el("logout-btn").hidden = true;
+  refreshQueued = false;
+  refreshQueuedFull = false;
+  stopPolling();
+  clearConsoleData();
+  setHidden("login-panel", false);
+  setHidden("console", true);
+  setHidden("logout-btn", true);
+  setHidden("refresh-btn", true);
+  setHidden("backup-btn", true);
+  setHidden("status-pills", true);
 }
 
 function showConsole() {
   state.authenticated = true;
-  el("login-panel").hidden = true;
-  el("console").hidden = false;
-  el("logout-btn").hidden = false;
+  setHidden("login-panel", true);
+  setHidden("console", false);
+  setHidden("logout-btn", false);
+  setHidden("refresh-btn", false);
+  setHidden("backup-btn", false);
+  setHidden("status-pills", false);
+  startPolling();
+}
+
+function startPolling() {
+  if (pollTimer !== null) return;
+  pollTimer = window.setInterval(() => {
+    if (!state.authenticated || document.hidden) return;
+    refreshAll();
+  }, POLL_MS);
+}
+
+function stopPolling() {
+  if (pollTimer === null) return;
+  window.clearInterval(pollTimer);
+  pollTimer = null;
+}
+
+function flashNote(text, tone) {
+  const note = el("session-note");
+  if (!note) return;
+  note.dataset.tone = tone || "info";
+  note.textContent = text;
+  window.setTimeout(() => {
+    if (note.textContent === text) {
+      note.textContent = DEFAULT_NOTE;
+      delete note.dataset.tone;
+    }
+  }, 6000);
 }
 
 async function attemptLogin(token) {
   await api("/api/login", { method: "POST", body: { token } });
-  await refreshAll();
+  sessionEpoch += 1;  // a fresh authenticated generation; stale loads are dropped
+  const epoch = sessionEpoch;
+  // Load status directly instead of through refreshAll(): the sign-in path must
+  // not depend on coalescing with a background cycle that started before login.
+  const status = await api("/api/status");
+  if (epoch !== sessionEpoch) return;  // a 401 already returned us to the login screen
+  showConsole();
+  applyStatus(status, { full: true });
+  await loadPanels(epoch);
+  if (!state.authenticated) throw new Error("unauthorized");
 }
 
 // -------------------------------------------------------------- rendering
@@ -145,31 +285,38 @@ function addMetric(list, label, value, tone) {
   list.append(wrap);
 }
 
-function renderMetrics(container, fund) {
-  container.replaceChildren();
-  addMetric(container, "基金净资产", formatMoney(fund.equity_units), metricTone(fund.equity_units));
-  addMetric(container, "交易桶现金", formatMoney(fund.wallet_units));
-  addMetric(container, "持仓价值", formatMoney(fund.position_value_units));
-  addMetric(container, "可用现金", formatMoney(fund.available_cash_units));
-  addMetric(container, "在外份额", formatShares(fund.shares_atoms));
-  addMetric(container, "已实现利润", formatMoney(fund.realized_profit_units), metricTone(fund.realized_profit_units));
-  addMetric(container, "费用余额", formatMoney(fund.fee_balance_units));
-  addMetric(container, "待确认收款", formatMoney(fund.pending_receipts_units));
-  addMetric(container, "应付款", formatMoney(fund.liabilities_units));
-  addMetric(container, "未认领款", formatMoney(fund.unclaimed_units));
-  addMetric(container, "资本流入", formatMoney(fund.capital_flows_units), metricTone(fund.capital_flows_units));
-  if (fund.benchmark_nav !== undefined) addMetric(container, "基准净值", formatNav(fund.benchmark_nav));
-  if (fund.user_shares_atoms !== undefined) addMetric(container, "我的份额", formatShares(fund.user_shares_atoms));
-  if (fund.user_value_units !== undefined) addMetric(container, "我的价值", formatMoney(fund.user_value_units));
+//: Headline figures stay visible; the accounting/reconciliation tail is the
+//: collapsed detail below. Every field the service publishes is still shown.
+function renderMetrics(primary, secondary, fund) {
+  if (primary) primary.replaceChildren();
+  if (secondary) secondary.replaceChildren();
+  addMetric(primary, "基金净资产", formatMoney(fund.equity_units), metricTone(fund.equity_units));
+  addMetric(primary, "在外份额", formatShares(fund.shares_atoms));
+  addMetric(primary, "可用现金", formatMoney(fund.available_cash_units));
+  addMetric(primary, "已实现利润", formatMoney(fund.realized_profit_units), metricTone(fund.realized_profit_units));
+  addMetric(secondary, "交易桶现金", formatMoney(fund.wallet_units));
+  addMetric(secondary, "持仓价值", formatMoney(fund.position_value_units));
+  addMetric(secondary, "费用余额", formatMoney(fund.fee_balance_units));
+  addMetric(secondary, "待确认收款", formatMoney(fund.pending_receipts_units));
+  addMetric(secondary, "应付款", formatMoney(fund.liabilities_units));
+  addMetric(secondary, "未认领款", formatMoney(fund.unclaimed_units));
+  addMetric(secondary, "资本流入", formatMoney(fund.capital_flows_units), metricTone(fund.capital_flows_units));
+  if (fund.benchmark_nav !== undefined) addMetric(secondary, "基准净值", formatNav(fund.benchmark_nav));
+  if (fund.user_shares_atoms !== undefined) addMetric(secondary, "我的份额", formatShares(fund.user_shares_atoms));
+  if (fund.user_value_units !== undefined) addMetric(secondary, "我的价值", formatMoney(fund.user_value_units));
 }
 
-function renderHolders(container, holders) {
+function emptyListItem(text) {
+  const li = document.createElement("li");
+  li.className = "empty";
+  li.textContent = text;
+  return li;
+}
+
+function renderHolders(container, holders, message) {
   container.replaceChildren();
-  if (!holders.length) {
-    const li = document.createElement("li");
-    li.className = "empty";
-    li.textContent = "暂无持有人记录";
-    container.append(li);
+  if (!Array.isArray(holders) || !holders.length) {
+    container.append(emptyListItem(message || "暂无持有人记录"));
     return;
   }
   for (const holder of holders) {
@@ -212,10 +359,36 @@ function parseHistory(history) {
   return points;
 }
 
-function drawNav(canvas, history) {
+function chartColors(canvas) {
+  // Read the light-theme palette from CSS so the chart follows the card accent
+  // (emerald for the first fund, amber for the second) without hard-coded hex.
+  const fallback = {
+    accent: "#0f9d7a",
+    accentSoft: "rgba(15, 157, 122, 0.16)",
+    grid: "#dfe5ec",
+    label: "#5b6f83",
+  };
+  let styles = null;
+  try { styles = window.getComputedStyle(canvas); } catch (err) { styles = null; }
+  if (!styles) return fallback;
+  const read = (name, fallbackValue) => {
+    const value = styles.getPropertyValue(name).trim();
+    return value || fallbackValue;
+  };
+  return {
+    accent: read("--accent", fallback.accent),
+    accentSoft: read("--accent-soft", fallback.accentSoft),
+    grid: read("--line", fallback.grid),
+    label: read("--muted", fallback.label),
+  };
+}
+
+function drawNav(canvas, history, emptyText) {
   const points = parseHistory(history);
   canvas.__history = history;
+  canvas.hidden = points.length === 0;
   const empty = canvas.parentElement.querySelector('[data-field="nav-empty"]');
+  if (empty && emptyText) empty.textContent = emptyText;
   const ctx = canvas.getContext("2d");
   const dpr = window.devicePixelRatio || 1;
   const cssWidth = Math.max(canvas.clientWidth || canvas.getBoundingClientRect().width || 320, 200);
@@ -225,10 +398,12 @@ function drawNav(canvas, history) {
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
   ctx.clearRect(0, 0, cssWidth, cssHeight);
 
+  const colors = chartColors(canvas);
+
   if (points.length < 2) {
     if (empty) empty.hidden = false;
     if (points.length === 1) {
-      ctx.fillStyle = "#2ec4b6";
+      ctx.fillStyle = colors.accent;
       ctx.beginPath();
       ctx.arc(cssWidth / 2, cssHeight / 2, 3, 0, Math.PI * 2);
       ctx.fill();
@@ -237,7 +412,7 @@ function drawNav(canvas, history) {
   }
   if (empty) empty.hidden = true;
 
-  const pad = { top: 12, right: 12, bottom: 20, left: 46 };
+  const pad = { top: 12, right: 12, bottom: 20, left: 52 };
   const plotW = cssWidth - pad.left - pad.right;
   const plotH = cssHeight - pad.top - pad.bottom;
   let min = Infinity;
@@ -256,10 +431,10 @@ function drawNav(canvas, history) {
   const xOf = (p) => pad.left + ((p.t - tMin) / tSpan) * plotW;
   const yOf = (p) => pad.top + (1 - (p.nav - min) / span) * plotH;
 
-  ctx.strokeStyle = "#16324a";
+  ctx.strokeStyle = colors.grid;
   ctx.lineWidth = 1;
   ctx.font = "10px Consolas, monospace";
-  ctx.fillStyle = "#8ca6ba";
+  ctx.fillStyle = colors.label;
   for (let i = 0; i <= 4; i += 1) {
     const y = pad.top + (plotH * i) / 4;
     ctx.beginPath();
@@ -271,8 +446,8 @@ function drawNav(canvas, history) {
   }
 
   const gradient = ctx.createLinearGradient(0, pad.top, 0, pad.top + plotH);
-  gradient.addColorStop(0, "rgba(46, 196, 182, 0.30)");
-  gradient.addColorStop(1, "rgba(46, 196, 182, 0.02)");
+  gradient.addColorStop(0, colors.accentSoft);
+  gradient.addColorStop(1, "rgba(255, 255, 255, 0)");
 
   ctx.beginPath();
   points.forEach((p, i) => {
@@ -295,35 +470,67 @@ function drawNav(canvas, history) {
     if (i === 0) ctx.moveTo(x, y);
     else ctx.lineTo(x, y);
   });
-  ctx.strokeStyle = "#2ec4b6";
-  ctx.lineWidth = 1.6;
+  ctx.strokeStyle = colors.accent;
+  ctx.lineWidth = 1.8;
   ctx.stroke();
 
   ctx.beginPath();
   ctx.arc(xOf(last), yOf(last), 3, 0, Math.PI * 2);
-  ctx.fillStyle = "#7fe3d8";
+  ctx.fillStyle = colors.accent;
   ctx.fill();
 }
 
 // ----------------------------------------------------------- fund cards
 
-function applyFund(card, fund) {
+function findCard(container, fundId) {
+  for (const child of container.children) {
+    if (child.classList && child.classList.contains("fund-card") && child.dataset.fundId === fundId) {
+      return child;
+    }
+  }
+  return null;
+}
+
+//: Updates a card in place. Only text nodes and the metric lists are rewritten,
+//: so open <details>, typed input values and focus survive a 5-second poll.
+function applyFund(card, fund, options = {}) {
+  const full = options.full === true;
   card.dataset.fundId = fund.fund_id || "";
-  card.querySelector('[data-field="label"]').textContent = fund.label || fund.fund_id || "未命名基金";
-  card.querySelector('[data-field="fund_id"]').textContent = fund.fund_id || "";
-  card.querySelector('[data-field="nav"]').textContent = formatNav(fund.nav);
-  card.querySelector('[data-field="updated_ms"]').textContent = formatTime(fund.updated_ms);
+  card.dataset.accent = options.accent || "emerald";
+
+  const setText = (field, text) => {
+    const node = card.querySelector(`[data-field="${field}"]`);
+    if (node && node.textContent !== text) node.textContent = text;
+  };
+
+  setText("label", fund.label || fund.fund_id || "未命名基金");
+  setText("fund_id", fund.fund_id || "");
+  setText("nav", formatNav(fund.nav));
+  setText("updated_ms", formatTime(fund.updated_ms));
 
   const badge = card.querySelector('[data-field="state"]');
   const [tone, text] = stateBadge(fund);
-  badge.dataset.state = tone;
-  badge.textContent = text;
+  if (badge) {
+    badge.dataset.state = tone;
+    if (badge.textContent !== text) badge.textContent = text;
+  }
 
-  renderMetrics(card.querySelector('[data-field="metrics"]'), fund);
-  const holdersBox = card.querySelector('[data-field="holders"]');
-  renderHolders(holdersBox, []);
-  loadHolders(card, fund.fund_id);
-  loadNavHistory(card, fund.fund_id);
+  setStatusLine(card.querySelector('[data-field="account-status"]'), accountStatusLine(fund));
+  setStatusLine(card.querySelector('[data-field="settlement-status"]'), settlementStatusLine(fund));
+
+  renderMetrics(
+    card.querySelector('[data-field="metrics"]'),
+    card.querySelector('[data-field="metrics-secondary"]'),
+    fund,
+  );
+
+  // The chart only needs a redraw when the snapshot actually moved.
+  const stamp = `${fund.updated_ms || ""}:${fund.nav || ""}`;
+  if (full || card.dataset.navStamp !== stamp) {
+    card.dataset.navStamp = stamp;
+    loadNavHistory(card, fund.fund_id, full);
+  }
+  if (full) loadHolders(card, fund.fund_id);
 }
 
 function normalizeFund(fund) {
@@ -333,11 +540,15 @@ function normalizeFund(fund) {
   return fund || {};
 }
 
-function renderFunds(funds) {
+function renderFunds(rawFunds, options = {}) {
   const container = el("funds");
-  container.replaceChildren();
   const template = el("fund-card-template");
-  if (!Array.isArray(funds) || !funds.length) {
+  const list = Array.isArray(rawFunds)
+    ? rawFunds.map(normalizeFund).filter((fund) => fund && typeof fund === "object")
+    : [];
+
+  if (!list.length) {
+    container.replaceChildren();
     const card = document.createElement("article");
     card.className = "card fund-card";
     const empty = document.createElement("p");
@@ -347,33 +558,73 @@ function renderFunds(funds) {
     container.append(card);
     return;
   }
-  for (const raw of funds) {
-    const fund = normalizeFund(raw);
-    const fragment = template.content.cloneNode(true);
-    const card = fragment.querySelector(".fund-card");
-    applyFund(card, fund);
-    wireControls(card);
-    container.append(fragment);
+
+  // Drop the "no data" placeholder, keep every live card.
+  for (const child of Array.from(container.children)) {
+    if (child.classList.contains("fund-card") && child.dataset.fundId === undefined) child.remove();
+  }
+
+  const seen = new Set();
+  list.forEach((fund, index) => {
+    const fundId = String(fund.fund_id || "");
+    seen.add(fundId);
+    let card = findCard(container, fundId);
+    const created = card === null;
+    if (created) {
+      const fragment = template.content.cloneNode(true);
+      card = fragment.querySelector(".fund-card");
+      card.dataset.fundId = fundId;
+      container.append(fragment);
+      wireControls(card);
+    }
+    applyFund(card, fund, {
+      full: created || options.full === true,
+      accent: index === 0 ? "emerald" : "amber",
+    });
+  });
+
+  for (const child of Array.from(container.children)) {
+    if (child.classList.contains("fund-card") && child.dataset.fundId !== undefined
+        && !seen.has(child.dataset.fundId)) {
+      child.remove();
+    }
   }
 }
 
-async function loadNavHistory(card, fundId) {
-  if (!fundId) return;
+async function loadNavHistory(card, fundId, full) {
+  const canvas = card.querySelector('[data-field="nav-chart"]');
+  if (!canvas) return;
+  if (!fundId) {
+    drawNav(canvas, [], "暂无净值记录");
+    return;
+  }
+  const epoch = sessionEpoch;
   try {
     const data = await api(`/api/funds/${encodeURIComponent(fundId)}/nav-history`);
-    drawNav(card.querySelector('[data-field="nav-chart"]'), data.history || []);
+    if (epoch !== sessionEpoch) return;
+    drawNav(canvas, data.history || [], "暂无净值记录");
   } catch (err) {
-    drawNav(card.querySelector('[data-field="nav-chart"]'), []);
+    if (epoch !== sessionEpoch || (err && err.message === "unauthorized")) return;
+    drawNav(canvas, [], `净值曲线加载失败：${err.message || err}`);
+    if (full) flashNote(`净值曲线加载失败：${err.message || err}`, "bad");
   }
 }
 
 async function loadHolders(card, fundId) {
-  if (!fundId) return;
+  const list = card.querySelector('[data-field="holders"]');
+  if (!list) return;
+  if (!fundId) {
+    renderHolders(list, [], "暂无持有人记录");
+    return;
+  }
+  const epoch = sessionEpoch;
   try {
     const data = await api(`/api/holders?fund_id=${encodeURIComponent(fundId)}`);
-    renderHolders(card.querySelector('[data-field="holders"]'), data.holders || []);
+    if (epoch !== sessionEpoch) return;
+    renderHolders(list, data.holders || [], "暂无持有人记录");
   } catch (err) {
-    renderHolders(card.querySelector('[data-field="holders"]'), []);
+    if (epoch !== sessionEpoch || (err && err.message === "unauthorized")) return;
+    renderHolders(list, [], `持有人加载失败：${err.message || err}`);
   }
 }
 
@@ -386,7 +637,7 @@ function wireControls(card) {
     try {
       await fn();
       feedback(card, `${label}成功`, "ok");
-      await refreshAll();
+      await refreshAll({ full: true });
     } catch (err) {
       if (err && err.message === "unauthorized") return;
       feedback(card, `${label}失败：${err.message || err}`, "bad");
@@ -403,7 +654,7 @@ function wireControls(card) {
         method: "POST",
         body: { username, password },
       });
-      form.password.value = "";
+      form.password.value = "";  // never keep the site password in the field
     });
   });
 
@@ -467,10 +718,7 @@ function renderEvents(events) {
   const list = el("events-list");
   list.replaceChildren();
   if (!Array.isArray(events) || !events.length) {
-    const li = document.createElement("li");
-    li.className = "empty";
-    li.textContent = "暂无事件";
-    list.append(li);
+    list.append(emptyListItem("暂无事件"));
     return;
   }
   for (const event of events) {
@@ -500,10 +748,7 @@ function renderOrders(orders) {
   const list = el("orders-list");
   list.replaceChildren();
   if (!Array.isArray(orders) || !orders.length) {
-    const li = document.createElement("li");
-    li.className = "empty";
-    li.textContent = "暂无订单";
-    list.append(li);
+    list.append(emptyListItem("暂无订单"));
     return;
   }
   for (const order of orders) {
@@ -519,18 +764,34 @@ function renderOrders(orders) {
   }
 }
 
-function renderBanner(status) {
-  const banner = el("status-banner");
-  banner.replaceChildren();
+function renderListMessage(listId, message) {
+  const list = el(listId);
+  if (!list) return;
+  list.replaceChildren(emptyListItem(message));
+}
+
+function bannerEntries(status) {
   const entries = [];
   const network = status.network || {};
-  const state = status.status || {};
+  const service = status.status || {};
+  const lastTick = Number(status.last_tick_ms);
   // `live` gates external writes (trading and transfers); it is not a real-money
   // "实盘" flag, so it is labelled as enabled writes vs a read-only preview.
   if (status.live !== undefined) entries.push(["运行模式", status.live ? "交易与转账已启用" : "只读预览"]);
-  if (network.state !== undefined) entries.push(["网络", String(network.state)]);
-  if (state.detail !== undefined) entries.push(["状态", String(state.detail)]);
-  if (state.last_health_ms !== undefined) entries.push(["最近健康检查", formatTime(state.last_health_ms)]);
+  if (network.state !== undefined) entries.push(["网络", ({unknown: "尚未检测", up: "已连接", down: "连接中断", degraded: "连接不稳定"})[network.state] || String(network.state)]);
+  if (service.detail !== undefined) entries.push(["服务状态", String(service.detail)]);
+  if (Number.isFinite(lastTick) && lastTick > 0) entries.push(["最近心跳", formatTime(lastTick)]);
+  else entries.push(["最近心跳", "尚无记录"]);
+  if (service.last_health_ms !== undefined) entries.push([network.state === "unknown" ? "最近状态更新" : "最近健康检查", formatTime(service.last_health_ms)]);
+  if (status.last_error) entries.push(["最近错误", String(status.last_error)]);
+  return entries;
+}
+
+function renderBanner(status) {
+  const banner = el("status-banner");
+  if (!banner) return;
+  banner.replaceChildren();
+  const entries = bannerEntries(status);
   if (!entries.length) {
     banner.classList.add("empty");
     return;
@@ -543,72 +804,135 @@ function renderBanner(status) {
     span.append(strong, document.createTextNode(value));
     banner.append(span);
   }
+}
+
+//: Badge text is evidence-based: a healthy network is only claimed after the
+//: service has actually completed a monitoring tick.
+function updateBadges(status) {
   const liveBadge = el("live-badge");
-  if (status.live) { liveBadge.dataset.state = "warn"; liveBadge.textContent = "交易与转账已启用"; }
-  else if (status.live !== undefined) { liveBadge.dataset.state = "ok"; liveBadge.textContent = "只读预览"; }
+  if (liveBadge) {
+    if (status.live === true) { liveBadge.dataset.state = "warn"; liveBadge.textContent = "交易与转账已启用"; }
+    else if (status.live === false) { liveBadge.dataset.state = "ok"; liveBadge.textContent = "只读预览"; }
+    else { liveBadge.dataset.state = "unknown"; liveBadge.textContent = "模式未知"; }
+  }
+
+  const netBadge = el("net-badge");
+  if (!netBadge) return;
+  const network = status.network || {};
+  const lastTick = Number(status.last_tick_ms);
+  const checked = Number.isFinite(lastTick) && lastTick > 0 && network.state !== undefined && network.state !== "unknown";
+  if (!checked) { netBadge.dataset.state = "unknown"; netBadge.textContent = "网络未知"; }
+  else if (network.ok === true) { netBadge.dataset.state = "ok"; netBadge.textContent = "网络正常"; }
+  else if (network.ok === false) { netBadge.dataset.state = "bad"; netBadge.textContent = "网络异常"; }
+  else { netBadge.dataset.state = "unknown"; netBadge.textContent = "网络未知"; }
 }
 
 function updateFilterOptions(funds) {
   const select = el("event-filter");
+  if (!select) return;
+  const wanted = funds.map((fund) => [fund.fund_id || "", fund.label || fund.fund_id || ""]);
+  const current = Array.from(select.options).slice(1).map((option) => [option.value, option.textContent]);
+  if (JSON.stringify(wanted) === JSON.stringify(current)) return;  // keep focus selection
   const previous = select.value;
   select.replaceChildren();
   const all = document.createElement("option");
   all.value = "";
   all.textContent = "全部基金";
   select.append(all);
-  for (const fund of funds) {
+  for (const [value, label] of wanted) {
     const option = document.createElement("option");
-    option.value = fund.fund_id || "";
-    option.textContent = fund.label || fund.fund_id || "";
+    option.value = value;
+    option.textContent = label;
     select.append(option);
   }
   select.value = previous;
+  if (select.value !== previous) select.value = "";
 }
 
 // ------------------------------------------------------------------ load
 
-async function loadStatus() {
-  const status = await api("/api/status");
-  const funds = Array.isArray(status.funds) ? status.funds.map(normalizeFund) : [];
-  state.funds = funds;
+function applyStatus(status, options = {}) {
+  state.lastStatus = status;
+  const funds = Array.isArray(status.funds) ? status.funds : [];
+  state.funds = funds.map(normalizeFund);
   renderBanner(status);
-  renderFunds(status.funds || []);
-  updateFilterOptions(funds);
-  renderEvents(status.events || []);
-  const netBadge = el("net-badge");
-  const network = status.network || {};
-  if (network.state === undefined) { netBadge.dataset.state = "unknown"; netBadge.textContent = "网络未知"; }
-  else if (network.ok === false) { netBadge.dataset.state = "bad"; netBadge.textContent = "网络异常"; }
-  else { netBadge.dataset.state = "ok"; netBadge.textContent = "网络正常"; }
+  updateBadges(status);
+  renderFunds(funds, { full: options.full === true });
+  updateFilterOptions(state.funds);
 }
 
-async function loadEvents() {
+async function loadEvents(epoch) {
   const query = new URLSearchParams({ limit: "100" });
   const filter = el("event-filter").value;
   if (filter) query.set("fund_id", filter);
-  const data = await api(`/api/events?${query.toString()}`);
-  renderEvents(data.events || []);
-}
-
-async function loadOrders() {
-  const filter = el("event-filter").value;
-  const query = new URLSearchParams({ limit: "100" });
-  if (filter) query.set("fund_id", filter);
-  const data = await api(`/api/orders?${query.toString()}`);
-  renderOrders(data.orders || []);
-}
-
-async function refreshAll() {
   try {
-    await loadStatus();
-    showConsole();
+    const data = await api(`/api/events?${query.toString()}`);
+    if (epoch !== sessionEpoch) return;
+    renderEvents(data.events || []);
   } catch (err) {
     if (err && err.message === "unauthorized") return;
-    const banner = el("status-banner");
-    banner.classList.remove("empty");
-    banner.replaceChildren();
-    banner.append(document.createTextNode(`状态加载失败：${err.message || err}`));
+    if (epoch !== sessionEpoch) return;
+    renderListMessage("events-list", `事件加载失败：${err.message || err}`);
   }
+}
+
+async function loadOrders(epoch) {
+  const query = new URLSearchParams({ limit: "100" });
+  const filter = el("event-filter").value;
+  if (filter) query.set("fund_id", filter);
+  try {
+    const data = await api(`/api/orders?${query.toString()}`);
+    if (epoch !== sessionEpoch) return;
+    renderOrders(data.orders || []);
+  } catch (err) {
+    if (err && err.message === "unauthorized") return;
+    if (epoch !== sessionEpoch) return;
+    renderListMessage("orders-list", `订单加载失败：${err.message || err}`);
+  }
+}
+
+async function loadPanels(epoch) {
+  await Promise.all([loadEvents(epoch), loadOrders(epoch)]);
+}
+
+async function doRefresh(options = {}) {
+  const epoch = sessionEpoch;
+  try {
+    const status = await api("/api/status");
+    if (epoch !== sessionEpoch) return;  // signed out (or re-signed in) while loading
+    showConsole();
+    applyStatus(status, { full: options.full === true });
+    await loadPanels(epoch);
+  } catch (err) {
+    if (err && err.message === "unauthorized") return;
+    if (epoch !== sessionEpoch) return;
+    const banner = el("status-banner");
+    if (banner) {
+      banner.classList.remove("empty");
+      banner.replaceChildren();
+      banner.append(document.createTextNode(`状态加载失败：${err.message || err}`));
+    }
+  }
+}
+
+//: Single-flight refresh: concurrent callers share one cycle, and a request that
+//: arrives mid-cycle triggers exactly one follow-up instead of a parallel load.
+function refreshAll(options = {}) {
+  if (refreshPromise) {
+    refreshQueued = true;
+    refreshQueuedFull = refreshQueuedFull || options.full === true;
+    return refreshPromise;
+  }
+  refreshPromise = doRefresh(options).finally(() => {
+    refreshPromise = null;
+    if (refreshQueued && state.authenticated) {
+      refreshQueued = false;
+      const full = refreshQueuedFull;
+      refreshQueuedFull = false;
+      refreshAll({ full });
+    }
+  });
+  return refreshPromise;
 }
 
 // ------------------------------------------------------------------ wiring
@@ -619,36 +943,47 @@ function wireStaticControls() {
     const input = el("login-token");
     const error = el("login-error");
     error.hidden = true;
+    const button = event.currentTarget.querySelector('button[type="submit"]');
+    if (button.disabled) return;
+    button.disabled = true;
+    button.textContent = "正在登录…";
     try {
       await attemptLogin(input.value);
-      input.value = "";
+      input.value = "";  // the control token never lingers in the field
     } catch (err) {
       error.hidden = false;
       error.textContent = err.message === "unauthorized" ? "令牌无效" : `登录失败：${err.message || err}`;
+    } finally {
+      button.disabled = false;
+      button.textContent = "进入控制台";
     }
   });
 
   el("logout-btn").addEventListener("click", async () => {
+    showLogin();
     try { await api("/api/logout", { method: "POST", body: {} }); } catch (err) { /* ignore */ }
     showLogin();
   });
 
-  el("refresh-btn").addEventListener("click", () => refreshAll());
-  el("events-refresh").addEventListener("click", () => loadEvents());
-  el("orders-refresh").addEventListener("click", () => loadOrders());
-  el("event-filter").addEventListener("change", () => { loadEvents(); loadOrders(); });
+  el("refresh-btn").addEventListener("click", () => refreshAll({ full: true }));
+  el("events-refresh").addEventListener("click", () => loadEvents(sessionEpoch));
+  el("orders-refresh").addEventListener("click", () => loadOrders(sessionEpoch));
+  el("event-filter").addEventListener("change", () => {
+    const epoch = sessionEpoch;
+    loadEvents(epoch);
+    loadOrders(epoch);
+  });
 
   el("backup-btn").addEventListener("click", async () => {
+    const epoch = sessionEpoch;
     try {
       const data = await api("/api/backup", { method: "POST", body: {} });
-      const banner = el("status-banner");
-      banner.classList.remove("empty");
-      banner.replaceChildren();
-      const strong = document.createElement("strong");
-      strong.textContent = "备份：";
-      banner.append(strong, document.createTextNode(data.backup || "已完成"));
+      if (epoch !== sessionEpoch) return;
+      flashNote(`备份完成：${data.backup || "已生成"}`, "ok");
     } catch (err) {
-      if (err && err.message !== "unauthorized") window.alert(`备份失败：${err.message || err}`);
+      if (err && err.message === "unauthorized") return;
+      if (epoch !== sessionEpoch) return;
+      flashNote(`备份失败：${err.message || err}`, "bad");
     }
   });
 
@@ -661,6 +996,10 @@ function wireStaticControls() {
         if (canvas) drawNav(canvas, canvas.__history || []);
       }
     }, 150);
+  });
+
+  document.addEventListener("visibilitychange", () => {
+    if (!document.hidden && state.authenticated) refreshAll();
   });
 }
 

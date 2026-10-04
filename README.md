@@ -144,6 +144,8 @@ README 不声称已完成部署。运维侧请读 [DEPLOYMENT.md](docs/DEPLOYMEN
 | --- | --- | --- |
 | [USAGE.md](docs/USAGE.md) | 开发者 | 环境、目录结构、契约、配置、鉴权、针对性测试与扩展策略的前置条件 |
 | [DEPLOYMENT.md](docs/DEPLOYMENT.md) | 运维 | Linux systemd / Windows 计划任务的部署包、安装与回滚物料 |
+| [前端更新说明](docs/FRONTEND_UPDATE.md) | 运维 | 新界面验证与静态文件替换方法 |
+| [未认领款核对方案](docs/UNCLAIMED_REVIEW_PLAN.md) | 管理人 | 原路退款与严格关联申购单的待审阅设计 |
 | [GUIDE.md](docs/GUIDE.md) | 基金方与持有人 | 产品规则：费用、窗口、预留份额、二维码与迟延退款、豁免与撤回 |
 | [INTRODUCTION.md](docs/INTRODUCTION.md) | 研究/评审 | 两只策略的研究口径、历史图表与压力情形分析 |
 | [AGENTS.md](AGENTS.md) | 一切自动化协作方 | 工作约定：偏好、文件所有权、最小改动与不可逾越的资金安全红线 |
