@@ -1,0 +1,44 @@
+[Unit]
+Description=Raricy 双基金资金服务（回环监听，经 SSH 隧道访问）
+Documentation=file:///opt/raricy-funds/docs/DEPLOYMENT.md
+After=network-online.target
+Wants=network-online.target
+# 同一份数据只允许一个写者：操作系统级数据档案锁（.raricy-data.lock）随进程退出由
+# 内核释放，不存在需要人工清理的陈旧锁；systemd 单实例只是额外一层。
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=raricy-funds
+Group=raricy-funds
+WorkingDirectory=/opt/raricy-funds
+
+# 凭据只从 0640/0600 的环境文件读取，绝不写进 unit 或镜像。
+# 该文件由运维在安装后手工放置（见 docs/DEPLOYMENT.md §4）。
+EnvironmentFile=-/etc/raricy-funds/funds.env
+
+# 根 CLI 负责信号关停与单写者锁；本 unit 不自建入口。
+ExecStart=/opt/raricy-funds/.venv/bin/python -m raricy_capital --config /etc/raricy-funds/funds.yaml
+
+# 稳定重启：崩溃、被 OOM、被信号打断都拉起来；停止走 SIGTERM，给足对账时间。
+Restart=always
+RestartSec=5
+KillSignal=SIGTERM
+TimeoutStopSec=45
+# 反复拉起也不要无限重启耗尽资源。
+StartLimitBurst=20
+
+# 最小权限：只写自己的数据目录，其余只读。
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/raricy-funds
+UMask=0077
+# 本机运行不依赖任何外部密钥环；避免启动期访问宿主凭据服务。
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+
+[Install]
+WantedBy=multi-user.target

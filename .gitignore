@@ -1,0 +1,46 @@
+# Python 构建与缓存
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# 运行期数据：默认数据目录 data/capital_funds（保留该默认以便备份兼容），
+# 数据库、日志、备份、迁移包与 OS 锁文件一律不入库。
+data/
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
+*.db
+*.db-wal
+*.db-shm
+logs/
+backups/
+exports/
+restore/
+.raricy-data.lock
+
+# 敏感数据：凭据、令牌与密钥永不入库、永不进镜像。
+credentials.enc
+credential.key
+admin.token
+.env
+
+# 工作区临时文件
+.build/
+*.log
+*.sha256
+*.part
+
+# 本地私密配置与密钥的其它写法
+.env.*
+!.env.example
+config.funds.yaml
+config.local.*
+*.pem
+*.key

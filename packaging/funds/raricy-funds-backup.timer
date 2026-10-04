@@ -1,0 +1,9 @@
+[Unit]
+Description=停机窗口备份定时器（**默认禁用，不安装**）
+# 默认**不安装、不启用** —— 运行中的每日备份不用外部定时器开第二个写者，改由服务
+# 内部每小时执行（backup_interval_seconds=3600）或经已认证的 POST /api/backup 触发。
+# 本 timer 不设 OnCalendar，也不会被 install.sh 安装，因此永不触发；需要停机备份时
+# 手工运行 raricy-funds-backup.service。
+
+[Timer]
+Unit=raricy-funds-backup.service

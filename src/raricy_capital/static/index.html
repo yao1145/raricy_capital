@@ -1,0 +1,151 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>双基金运营台 · 小鱼干账簿</title>
+<link rel="stylesheet" href="/static/style.css">
+<script src="/static/app.js" defer></script>
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">
+    <span class="mark" aria-hidden="true"></span>
+    <div>
+      <h1>双基金运营台</h1>
+      <p class="sub" id="brand-sub">小鱼干 · 温和增长 / 激进增长</p>
+    </div>
+  </div>
+  <div class="top-actions">
+    <span class="badge" id="live-badge" data-state="unknown">连接未知</span>
+    <span class="badge" id="net-badge" data-state="unknown">网络未知</span>
+    <button type="button" class="btn ghost" id="refresh-btn">刷新</button>
+    <button type="button" class="btn ghost" id="backup-btn">备份</button>
+    <button type="button" class="btn ghost" id="logout-btn" hidden>退出</button>
+  </div>
+</header>
+
+<section id="login-panel" class="login-panel" hidden>
+  <form id="login-form" class="card login-card" autocomplete="off">
+    <h2>管理令牌登录</h2>
+    <p class="hint">令牌仅随本次请求提交，浏览器不保存明文，只保留短期本地会话 Cookie。</p>
+    <label class="field">
+      <span>控制令牌</span>
+      <input type="password" id="login-token" name="token" autocomplete="current-password" required>
+    </label>
+    <button type="submit" class="btn primary">进入控制台</button>
+    <p class="error" id="login-error" hidden></p>
+  </form>
+</section>
+
+<main id="console" hidden>
+  <section class="banner" id="status-banner"></section>
+
+  <section class="funds" id="funds"></section>
+
+  <section class="panels">
+    <div class="card panel">
+      <header class="panel-head">
+        <h2>运行日志 / 事件</h2>
+        <div class="panel-tools">
+          <select id="event-filter">
+            <option value="">全部基金</option>
+          </select>
+          <button type="button" class="btn small ghost" id="events-refresh">刷新</button>
+        </div>
+      </header>
+      <ul class="log-list" id="events-list"></ul>
+    </div>
+
+    <div class="card panel">
+      <header class="panel-head">
+        <h2>订单 / 付款</h2>
+        <div class="panel-tools">
+          <button type="button" class="btn small ghost" id="orders-refresh">刷新</button>
+        </div>
+      </header>
+      <ul class="log-list" id="orders-list"></ul>
+    </div>
+  </section>
+</main>
+
+<template id="fund-card-template">
+  <article class="card fund-card">
+    <header class="fund-head">
+      <div>
+        <h2 class="fund-label" data-field="label"></h2>
+        <p class="fund-id" data-field="fund_id"></p>
+      </div>
+      <span class="badge" data-field="state" data-state="unknown"></span>
+    </header>
+
+    <div class="nav-block">
+      <div class="nav-headline">
+        <div>
+          <span class="metric-label">单位净值</span>
+          <strong class="nav-value" data-field="nav">—</strong>
+        </div>
+        <span class="nav-updated" data-field="updated_ms"></span>
+      </div>
+      <canvas class="nav-chart" data-field="nav-chart" height="150" aria-label="净值曲线"></canvas>
+      <p class="empty" data-field="nav-empty" hidden>暂无净值记录</p>
+    </div>
+
+    <dl class="metrics" data-field="metrics"></dl>
+
+    <details class="subsection">
+      <summary>份额持有人</summary>
+      <ul class="holders" data-field="holders"></ul>
+    </details>
+
+    <div class="controls">
+      <details class="subsection">
+        <summary>登录站点账户</summary>
+        <form class="control-form" data-action="login" autocomplete="off">
+          <label class="field"><span>账户</span><input name="username" autocomplete="off" required></label>
+          <label class="field"><span>密码</span><input name="password" type="password" autocomplete="new-password" required></label>
+          <p class="hint">凭据仅用于本次登录请求，不写入浏览器存储。</p>
+          <button type="submit" class="btn small">登录站点</button>
+        </form>
+      </details>
+
+      <details class="subsection">
+        <summary>机构种子出资</summary>
+        <form class="control-form" data-action="seed">
+          <label class="field"><span>用户 ID</span><input name="user_id" required></label>
+          <label class="field"><span>净本金（小鱼干）</span><input name="principal" inputmode="decimal" placeholder="如 2000" required></label>
+          <button type="submit" class="btn small">登记出资</button>
+        </form>
+      </details>
+
+      <div class="subsection inline-controls">
+        <button type="button" class="btn small" data-action="start">启动交易</button>
+        <button type="button" class="btn small ghost" data-action="pause">暂停交易</button>
+        <button type="button" class="btn small danger" data-action="stop">永久停机</button>
+      </div>
+
+      <details class="subsection">
+        <summary>结算</summary>
+        <form class="control-form" data-action="settle">
+          <label class="field"><span>月度期间（YYYY-MM，可留空）</span><input name="period" placeholder="2026-10"></label>
+          <button type="submit" class="btn small">执行月度结算</button>
+        </form>
+        <button type="button" class="btn small ghost" data-action="settle-emergency">执行紧急结算</button>
+      </details>
+
+      <details class="subsection">
+        <summary>分红选择</summary>
+        <form class="control-form" data-action="dividend">
+          <label class="field"><span>用户 ID</span><input name="user_id" required></label>
+          <label class="field"><span>复投比例（0 - 1）</span><input name="fraction" inputmode="decimal" placeholder="0 现金 / 1 全额复投" required></label>
+          <button type="submit" class="btn small">提交选择</button>
+        </form>
+      </details>
+    </div>
+    <p class="feedback" data-field="feedback" hidden></p>
+  </article>
+</template>
+
+</body>
+</html>

@@ -1,0 +1,20 @@
+[Unit]
+Description=Raricy 资金服务停机窗口一次性备份（**默认禁用、不由安装脚本安装**）
+# 运行中的备份由服务内部每小时执行（backup_interval_seconds=3600），或经控制台
+# 已认证的 POST /api/backup 触发。本 unit 只用于停机窗口的人工备份：
+# tools/run_capital_service.py 会先取与 root 服务**同一把** OS 数据锁，服务在线时以
+# service_running 拒绝，绝不并发写第二个写者。
+Documentation=file:///opt/raricy-funds/docs/DEPLOYMENT.md
+
+[Service]
+Type=oneshot
+User=raricy-funds
+Group=raricy-funds
+WorkingDirectory=/opt/raricy-funds
+EnvironmentFile=-/etc/raricy-funds/funds.env
+# --config 提供 data_dir；--keep 与 config.backup_retention 保持一致。
+ExecStart=/opt/raricy-funds/.venv/bin/python tools/run_capital_service.py \
+    --config /etc/raricy-funds/funds.yaml backup --keep 72
+# 备份是低优先级后台工作，避免抢占交易进程的 CPU 与磁盘。
+Nice=10
+IOSchedulingClass=idle

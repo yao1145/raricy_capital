@@ -1,0 +1,32 @@
+# capital1 / capital2 独立基金资金服务配置示例（YAML）
+#
+# **注意：本文件是 YAML，不是 JSON。** 下面这些以 `#` 开头的注释在 JSON 里是非法的，
+# 整份文件按 JSON 解析会直接失败；即使把注释删干净，也请统一按 YAML 语法编辑。
+# 加载器用 yaml.safe_load，YAML 恰好也接受 JSON 子集（双引号键名、无注释），但那只是
+# 巧合，不是「本文件是 JSON」。
+#
+# 字段与 src/raricy_capital/config.py 的 FundConfig 一一对应；出现未知字段、非回环
+# host、越界 port/周期等都会使服务启动失败。这里**只放非敏感配置**：站点账号、口令、
+# 控制令牌一律只来自环境文件或数据目录里的凭据库（见 funds.env.example）。
+#
+# 用法：
+#   python -m raricy_capital --config <本文件副本>
+# Linux 安装脚本会把它复制到 /etc/raricy-funds/funds.yaml，并把 data_dir 改写为
+# /var/lib/raricy-funds；源码目录与 Windows 本地运行保持下面的相对默认值。
+
+data_dir: data/capital_funds
+host: 127.0.0.1
+port: 8137
+site_url: https://raricy.com
+# 外部写总闸：默认 false（只读预览：不下单、不转账、不发私聊）。确需真实操作时改为
+# true，或改用 CLI 的 --live 开关（两者任一为真即生效）；见 docs/DEPLOYMENT.md「只读优先」。
+live: false
+tick_seconds: 4
+backup_interval_seconds: 3600
+backup_retention: 72
+
+# 其余字段留空即用 FundConfig 的默认值。**未知字段会被拒绝**，所以下面这些只在需要
+# 覆盖默认值时才取消注释；不要写 config.py 里没有的键。
+# outage_failure_threshold: 3   # 连续 3 次探测失败判定断线（tick_seconds 一次）
+# log_max_bytes: 10485760       # 单段 JSONL 日志上限，超出轮转
+# log_backup_count: 10          # 保留的日志段数

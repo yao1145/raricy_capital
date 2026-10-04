@@ -1,0 +1,27 @@
+[Unit]
+# 运行在**运维/管理员本机**，不是服务器：把服务器回环端口映射到本地回环。
+# 服务端只监听 127.0.0.1，绝不直接暴露到公网；访问一律经这条 SSH 隧道。
+Description=Raricy 资金服务本机 SSH 隧道（127.0.0.1:8137 → 服务器回环）
+Documentation=file:///opt/raricy-funds/docs/DEPLOYMENT.md
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=%i
+# 用部署时生成的专用密钥，口令保护由宿主 ssh-agent 负责；密钥绝不进 unit。
+Environment=SSH_KEY=/home/%i/.ssh/raricy_funds_tunnel
+Environment=SERVER=funds-operator@your-server-host
+Environment=PORT=8137
+# -N 不执行远端命令；ExitOnForwardFailure 让端口占用立即失败而不是静默不转发。
+ExecStart=/usr/bin/ssh -N -o BatchMode=yes -o ExitOnForwardFailure=yes \
+    -o ServerAliveInterval=30 -o ServerAliveCountMax=3 \
+    -o StrictHostKeyChecking=accept-new \
+    -i ${SSH_KEY} \
+    -L 127.0.0.1:${PORT}:127.0.0.1:${PORT} ${SERVER}
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=default.target
