@@ -12,7 +12,7 @@ from urllib.parse import urlsplit
 
 from cryptography.fernet import Fernet, InvalidToken
 
-from .contracts import FundError, POLICIES
+from .contracts import FundError, POLICIES, validate_control_user_id
 
 
 def private_write(path: Path, data: bytes) -> None:
@@ -45,8 +45,12 @@ class FundConfig:
     log_max_bytes: int = 10 * 1024 * 1024
     log_backup_count: int = 10
     control_token: str = field(default='', repr=False)
+    control_user_id: str = ''
 
     def __post_init__(self) -> None:
+        self.control_user_id = validate_control_user_id(self.control_user_id)
+        if not self.control_user_id:
+            self.control_user_id = validate_control_user_id(os.environ.get('FUNDS_CONTROL_USER_ID', ''))
         self.data_dir = Path(self.data_dir).expanduser().resolve()
         if self.host != '127.0.0.1':
             raise FundError('loopback_required')
@@ -79,6 +83,7 @@ class FundConfig:
     def public(self) -> dict:
         return {'host': self.host, 'port': self.port, 'site_url': self.site_url,
                 'live': self.live, 'tick_seconds': self.tick_seconds,
+                'control_user_id': self.control_user_id,
                 'backup_interval_seconds': self.backup_interval_seconds,
                 'backup_retention': self.backup_retention,
                 'policies': {k: p.public() for k, p in POLICIES.items()}}
@@ -119,7 +124,7 @@ class FundConfig:
             if values.pop('policies') != {k: p.public() for k, p in POLICIES.items()}:
                 raise FundError('policies_are_frozen')
         allowed = {'data_dir', 'host', 'port', 'site_url', 'live', 'tick_seconds', 'backup_interval_seconds',
-                   'backup_retention', 'outage_failure_threshold', 'log_max_bytes', 'log_backup_count'}
+                   'backup_retention', 'outage_failure_threshold', 'log_max_bytes', 'log_backup_count', 'control_user_id'}
         if not isinstance(values, dict) or set(values) - allowed:
             raise FundError('invalid_configuration')
         if data_dir is not None:

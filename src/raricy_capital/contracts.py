@@ -4,6 +4,13 @@ from dataclasses import dataclass,asdict
 from decimal import Decimal,InvalidOperation
 from datetime import datetime,timezone,timedelta
 import time
+import re
+
+def validate_control_user_id(value: object) -> str:
+    if not isinstance(value, str) or (value and re.fullmatch(r"[A-Za-z0-9_.:-]{1,128}", value) is None):
+        raise FundError("invalid_control_user")
+    return value
+
 
 MONEY_SCALE=10000
 SHARE_SCALE=100000000

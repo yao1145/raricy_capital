@@ -7,7 +7,7 @@
 3. `src/raricy_capital/trader.py`（运行时闸门与状态机）；
 4. 研究计划记录（`evidence.json.capital2.plan`）——**只在实现里存在对应字段时才有效**。
 
-任何参数改动都要走 [USAGE.md](../USAGE.md) §9 的「研究 → 冻结 → 实现 → 文档」流程，
+任何参数改动都要走 [USAGE.md](../../usage/USAGE.md) §9 的「研究 → 冻结 → 实现 → 文档」流程，
 配置里写死策略会被 `policies_are_frozen` 拦下。
 
 ## 1. 数据与指标

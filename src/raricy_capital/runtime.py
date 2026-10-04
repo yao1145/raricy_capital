@@ -32,7 +32,7 @@ LOGIN_RETRY_AFTER_CAP_MS = 3_600_000
 #: a mismatched identity or a fund account clash is an operator problem; retrying
 #: cannot fix it and could lock the account or cross identities.
 PERMANENT_LOGIN_CODES = frozenset({
-    'unauthorized', 'identity_mismatch', 'fund_accounts_must_differ',
+    'unauthorized', 'identity_mismatch', 'fund_accounts_must_differ', 'control_user_cannot_be_fund_account',
     'account_identity_changed', 'credentials_required', 'invalid_base_url',
 })
 
@@ -82,11 +82,152 @@ def _is_past_period(period: object, stamp: int) -> bool:
     return cutoff <= stamp
 
 
+# ── Unclaimed-receipt review: manual entry points, audit boundary, re-read ─────
+
+#: The two approved manual outcomes for an unclaimed receipt; there is no third.
+UNCLAIMED_ACTIONS = ('link', 'refund')
+#: Bound for the independent receipt re-read (pages x 100 rows).  The review owns
+#: this bounded scan and **never** touches the receipt-polling cursor: ``pay_cursors``
+#: belongs to the payments worker alone.
+RECEIPT_SCAN_MAX_PAGES = 20
+_UNCLAIMED_REASON_MAX = 500
+_UNCLAIMED_ACTOR_MAX = 128
+_SUBSCRIPTION_RE = re.compile(r'[A-Za-z0-9_.:-]{1,64}\Z')
+
+# Stable refusal codes for the manual review.  ``receipt_*`` codes mean "hold for
+# review": either the upstream row could not be confirmed or it disagrees with the
+# stored record, and neither may be resolved on an assumption.
+RECEIPT_UNIDENTIFIED = 'receipt_unidentified'
+RECEIPT_MISMATCH = 'receipt_mismatch'
+RECEIPT_MISSING = 'receipt_missing'
+SCAN_INCOMPLETE = 'scan_incomplete'
+
+
+def _unclaimed_action(value: object) -> str:
+    if not isinstance(value, str) or value not in UNCLAIMED_ACTIONS:
+        raise FundError('invalid_action')
+    return value
+
+
+def _unclaimed_reason(value: object) -> str:
+    if not isinstance(value, str):
+        raise FundError('invalid_reason')
+    reason = value.strip()
+    if not reason or len(reason) > _UNCLAIMED_REASON_MAX:
+        raise FundError('invalid_reason')
+    return reason
+
+
+def _unclaimed_actor(value: object) -> str:
+    """Audit actor: an opaque server-derived id, never a raw session or token."""
+    if not isinstance(value, str):
+        raise FundError('invalid_actor')
+    actor = value.strip()
+    if not actor or len(actor) > _UNCLAIMED_ACTOR_MAX:
+        raise FundError('invalid_actor')
+    return actor
+
+
+def _unclaimed_version(value: object) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise FundError('invalid_version')
+    return value
+
+
+def _unclaimed_subscription(value: object) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str) or _SUBSCRIPTION_RE.fullmatch(value.strip()) is None:
+        raise FundError('invalid_subscription_id')
+    return value.strip()
+
+
+def _receipt_view(detail: object) -> dict:
+    """Receipt fields of a detail, tolerating a nested ``record``/``receipt``."""
+    if not isinstance(detail, dict):
+        return {}
+    fields = dict(detail)
+    for key in ('record', 'receipt'):
+        inner = detail.get(key)
+        if isinstance(inner, dict):
+            for name, value in inner.items():
+                fields.setdefault(name, value)
+    return fields
+
+
+def _receipt_units(value: object) -> int | None:
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return value
+
+
+def _receipt_note(value: object) -> str:
+    return value if isinstance(value, str) else ''
+
+
+def _receipt_matches(row: dict, receipt: dict) -> bool:
+    """The upstream row and the stored record must be the same immutable tuple.
+
+    Transfer id, payer, integer amount, original note and (when both sides parsed
+    one) the authoritative arrival time all have to agree; anything else is a hold.
+    """
+    if row.get('transfer_id') != receipt.get('transfer_id'):
+        return False
+    if _receipt_units(row.get('amount_units')) != _receipt_units(receipt.get('amount_units')):
+        return False
+    if row.get('from_user_id') != receipt.get('from_user_id'):
+        return False
+    if _receipt_note(row.get('note')) != _receipt_note(receipt.get('note')):
+        return False
+    arrived = _receipt_units(row.get('occurred_ms'))
+    recorded = _receipt_units(receipt.get('occurred_ms'))
+    if arrived is not None and recorded is not None and arrived != recorded:
+        return False
+    return True
+
+
+def _transaction_rows(page: object) -> list[dict]:
+    if not isinstance(page, dict):
+        return []
+    rows = page.get('transactions')
+    if not isinstance(rows, list):
+        return []
+    return [row for row in rows if isinstance(row, dict)]
+
+
+def _row_outcome(row: dict, receipt: dict, transfer_id: str) -> tuple[dict | None, str | None]:
+    """Turn a matched upstream row into ``verified_transfer`` (site is authority)."""
+    if row.get('type') != 'transfer_receive' or not _receipt_matches(row, receipt):
+        return None, RECEIPT_MISMATCH
+    verified = dict(row)
+    verified['transfer_id'] = transfer_id
+    if verified.get('transaction_row_id') is None:
+        verified['transaction_row_id'] = _receipt_units(row.get('id'))
+    return verified, None
+
+
+def _mark_ineligible(preview: object, error: str) -> dict:
+    """Fold a re-read failure into the preview: better ineligible than mislabelled."""
+    if not isinstance(preview, dict):
+        return {'eligible': False, 'errors': [error]}
+    result = dict(preview)
+    errors = [code for code in (result.get('errors') or []) if isinstance(code, str)]
+    if error not in errors:
+        errors.append(error)
+    result['errors'] = errors
+    result['eligible'] = False
+    return result
+
+
 class FundService:
     def __init__(self, config: FundConfig):
         self.config = config
         self.store = FundStore(config.data_dir / 'funds.sqlite3')
-        self.ledger = FundLedger(self.store)
+        if config.control_user_id and any(str(a.get('user_id')) == config.control_user_id
+                for _, a in self.store.list_items('accounts')):
+            self.store.close()
+            raise FundError('control_user_cannot_be_fund_account')
+        self.ledger = FundLedger(self.store, control_user_id=config.control_user_id)
         self.vault = CredentialVault(config.data_dir)
         self.clients: dict[str, FundSiteClient] = {}
         self.handlers: dict[str, CommandHandler] = {}
@@ -121,6 +262,8 @@ class FundService:
         try:
             account = await client.login()
             stable_id = str(account['id'])
+            if self.config.control_user_id and stable_id == self.config.control_user_id:
+                raise FundError('control_user_cannot_be_fund_account')
             for other, record in self.store.list_items('accounts'):
                 if other != fund_id and str(record['user_id']) == stable_id:
                     raise FundError('fund_accounts_must_differ')
@@ -571,6 +714,137 @@ class FundService:
     def nav_history(self, fund_id: str, limit: int = 365) -> list:
         self._fund(fund_id)
         return self.store.list('nav_history', f'{fund_id}:')[-min(max(int(limit), 1), 10000):]
+
+    # ── unclaimed-receipt manual review ──────────────────────────────────────
+
+    def unclaimed(self, fund_id: str | None = None, status: str | None = None) -> list:
+        """Per-receipt unclaimed list (filterable); a pure read, no site, no write."""
+        if fund_id is not None:
+            self._fund(fund_id)
+        return self.ledger.unclaimed(fund_id, status)
+
+    def unclaimed_detail(self, fund_id: str, unclaimed_id: str) -> dict:
+        """One receipt's detail (fields, version, candidates, history); pure read."""
+        self._fund(fund_id)
+        return self.ledger.unclaimed_detail(fund_id, unclaimed_id, now_ms())
+
+    async def preview_unclaimed(self, fund_id: str, unclaimed_id: str, action: str,
+                                subscription_id: str | None = None) -> dict:
+        """Preview a manual outcome: re-read the receipt outside any DB transaction.
+
+        Read-only and permitted while ``live`` is off (the console still shows the
+        verification result).  A failed or disagreeing re-read reports
+        ``eligible=False`` with a stable code, never an optimistic preview.
+        """
+        self._fund(fund_id)
+        action = _unclaimed_action(action)
+        subscription_id = _unclaimed_subscription(subscription_id)
+        client = self._client_for(fund_id)
+        detail = self.ledger.unclaimed_detail(fund_id, unclaimed_id, now_ms())
+        verified, error = await self._authoritative_receipt(client, detail)
+        preview = self.ledger.preview_unclaimed(
+            fund_id, unclaimed_id, action, subscription_id=subscription_id,
+            verified_transfer=verified, now_ms=now_ms())
+        if error:
+            preview = _mark_ineligible(preview, error)
+        return preview
+
+    async def resolve_unclaimed(self, fund_id: str, unclaimed_id: str, action: str, *,
+                                version: int, reason: str, actor: str,
+                                subscription_id: str | None = None) -> dict:
+        """Commit a manual outcome: live gate, fresh re-read, then atomic ledger CAS.
+
+        Every authority field except ``action`` is server-side: ``actor`` is the
+        opaque id the web layer derived from the authenticated credential, and this
+        method only bounds and passes it through.  ``live=False`` is refused before
+        any site read, state change or payout intent.
+        """
+        self._fund(fund_id)
+        action = _unclaimed_action(action)
+        reason = _unclaimed_reason(reason)
+        actor = _unclaimed_actor(actor)
+        subscription_id = _unclaimed_subscription(subscription_id)
+        version = _unclaimed_version(version)
+        if not self.config.live:
+            raise FundError('live_required')
+        client = self._client_for(fund_id)
+        detail = self.ledger.unclaimed_detail(fund_id, unclaimed_id, now_ms())
+        verified, error = await self._authoritative_receipt(client, detail)
+        if verified is None:
+            raise FundError(error or 'receipt_unverified')
+        async with self.mutex:
+            if not self.config.live:
+                raise FundError('live_required')
+            if self.clients.get(fund_id) is not client:
+                raise FundError('account_changed')
+            return self.ledger.resolve_unclaimed(
+                fund_id, unclaimed_id, action, version=version, reason=reason, actor=actor,
+                verified_transfer=verified, now_ms=now_ms(), subscription_id=subscription_id)
+
+    def _client_for(self, fund_id: str) -> FundSiteClient:
+        client = self.clients.get(fund_id)
+        if client is None:
+            raise FundError('account_login_required')
+        return client
+
+    async def _authoritative_receipt(self, client: FundSiteClient,
+                                     detail: object) -> tuple[dict | None, str | None]:
+        """Independently re-read one receipt: ``(upstream row, stable error code)``.
+
+        Only normalized ``transfer_receive`` rows count, and the row has to form the
+        exact same immutable tuple as the stored record (id, payer, integer amount,
+        note, arrival time).  Any conflict or upstream failure is returned as a
+        stable code so the caller holds the row instead of assuming.
+        """
+        receipt = _receipt_view(detail)
+        transfer_id = receipt.get('transfer_id')
+        if not isinstance(transfer_id, str) or not transfer_id:
+            return None, RECEIPT_UNIDENTIFIED
+        try:
+            return await self._lookup_receipt(client, receipt, transfer_id)
+        except FundSiteError as exc:
+            return None, exc.code
+        except FundError as exc:
+            return None, exc.code
+
+    async def _lookup_receipt(self, client: FundSiteClient, receipt: dict,
+                              transfer_id: str) -> tuple[dict | None, str | None]:
+        row_id = _receipt_units(receipt.get('transaction_row_id'))
+        if row_id is not None and row_id > 0:
+            # Fast path: row ids are immutable, so one page after ``row_id - 1``
+            # settles it without walking the whole history.
+            page = await client.transactions(row_id - 1)
+            for row in _transaction_rows(page):
+                if row.get('id') != row_id:
+                    continue
+                return _row_outcome(row, receipt, transfer_id)
+        return await self._scan_receipt(client, receipt, transfer_id)
+
+    async def _scan_receipt(self, client: FundSiteClient, receipt: dict,
+                            transfer_id: str) -> tuple[dict | None, str | None]:
+        """Bounded legacy scan from 0, for rows stored before row ids existed."""
+        cursor = 0
+        for _ in range(RECEIPT_SCAN_MAX_PAGES):
+            page = await client.transactions(cursor)
+            for row in _transaction_rows(page):
+                if row.get('type') != 'transfer_receive':
+                    continue
+                if row.get('transfer_id') != transfer_id:
+                    continue
+                return _row_outcome(row, receipt, transfer_id)
+            if not isinstance(page, dict):
+                return None, SCAN_INCOMPLETE
+            next_cursor = page.get('next_cursor', cursor)
+            if not page.get('has_more'):
+                # Scanned to the end without finding it: the receipt is genuinely
+                # absent upstream, so the row stays held for review.
+                return None, RECEIPT_MISSING
+            if isinstance(next_cursor, bool) or not isinstance(next_cursor, int) \
+                    or next_cursor <= cursor:
+                return None, SCAN_INCOMPLETE
+            cursor = next_cursor
+        # An unfinished scan never proves absence: hold rather than conclude.
+        return None, SCAN_INCOMPLETE
 
     async def close(self) -> None:
         self._closed = True

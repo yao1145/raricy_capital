@@ -134,7 +134,7 @@ echo "  4) 隧道：在**运维本机**把 packaging/funds/raricy-funds-tunnel.s
 echo "     （~/.config/systemd/user/ + systemctl --user enable --now）；Windows 运维机直接用 ssh -L。"
 echo "  5) 备份：运行中的备份由服务内部每小时执行（backup_interval_seconds=3600），"
 echo "     也可在控制台触发已认证的 POST /api/backup；不要用外部定时器开第二个写者。"
-echo "  6) 完整要点与人工验收清单见 docs/DEPLOYMENT.md。"
+echo "  6) 完整要点与人工验收清单见 docs/usage/DEPLOYMENT.md。"
 
 if [[ "$ENABLE" -eq 1 ]]; then
   echo "==> 启用并启动服务"

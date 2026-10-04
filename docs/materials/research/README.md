@@ -1,9 +1,9 @@
-# docs/research · 研究材料索引
+# docs/materials/research · 研究材料索引
 
-本目录只放**研究证据与口径说明**，不放产品规则（那在 [GUIDE.md](../GUIDE.md) 与
-[docs/FUND_PLAN_V0.3.md](../FUND_PLAN_V0.3.md)），也不放代码契约（那在
-[USAGE.md](../USAGE.md)）。读者定位为研究/评审；研究总览与结论见
-[INTRODUCTION.md](../INTRODUCTION.md)。
+本目录只放**研究证据与口径说明**，不放产品规则（那在 [GUIDE.md](../../usage/GUIDE.md) 与
+[FUND_PLAN_V0.3.md](../../funds/FUND_PLAN_V0.3.md)），也不放代码契约（那在
+[USAGE.md](../../usage/USAGE.md)）。读者定位为研究/评审；研究总览与结论见
+[INTRODUCTION.md](../../funds/INTRODUCTION.md)。
 
 ## 1. 文件清单
 
@@ -58,7 +58,7 @@
 原始研究包在旧工程目录里，本仓库**不复制**它们；需要复核时按上表核对哈希。
 
 **注意**：H570 暂存的就是 `btc_highrisk_funds_2026-10-03_final_r90` 研究包，它的正常情景全区间
-净利润 `112483490.5353` 与 [docs/FUND_PLAN_V0.3.md](../FUND_PLAN_V0.3.md) 附录一致。
+净利润 `112483490.5353` 与 [FUND_PLAN_V0.3.md](../../funds/FUND_PLAN_V0.3.md) 附录一致。
 本目录的表格与配图统一引用该最终版本，精确值见 `evidence.json`。
 
 ## 4. 结构速查

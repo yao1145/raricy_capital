@@ -4,7 +4,7 @@
 测试怎么跑，以及**改策略之前必须先做什么**。
 
 运维部署看 [DEPLOYMENT.md](DEPLOYMENT.md)；产品规则看 [GUIDE.md](GUIDE.md)；协作约定
-看 [AGENTS.md](../AGENTS.md)；架构总览看 [README.md](../README.md)。
+看 [AGENTS.md](../../AGENTS.md)；架构总览看 [README.md](../../README.md)。
 
 ---
 
@@ -48,11 +48,15 @@ raricy_capital/
 ├── tools/run_capital_service.py                   运维 CLI（薄封装）
 ├── tests/                                         针对性测试（直接 import raricy_capital）
 ├── packaging/funds/                               部署物料（systemd / 计划任务 / 样例配置）
-├── docs/                                          USAGE、DEPLOYMENT、GUIDE、INTRODUCTION
-│   ├── research/                                 历史证据与口径
-│   └── assets/                                   研究图表
+├── docs/                                          文档索引与归档索引
+│   ├── design/                                    接口与人工核对的现行设计
+│   ├── usage/                                     开发、部署、投资者与操作手册
+│   ├── funds/                                     基金规则与研究报告
+│   ├── materials/                                 研究证据与配图
+│   └── archive/                                   已完成更新的历史记录
 └── data/capital_funds/                            默认数据目录（本机状态，不进版本库）
 ```
+
 
 约定：**资金模块直接放在 `src/raricy_capital/` 下**；入口 `__main__.py` 直接导入
 `data_lock`，其它资金模块按需从同级的 chat_models、site_protocol、hourly_signals 和 safe_logging 导入。
@@ -160,6 +164,21 @@ python tools/run_capital_service.py --config <config.yaml> serve <根入口的�
   清仓式赎回（一批取走全部在外份额）免收紧急费。
 - **幂等键**：私聊消息 ID → 订单；`transfer_id` → 收款；`trade_id`/`position_id` → 交易；
   同一键重放返回原记录，不会重复动账。
+- **未认领款核对**：人工关联只把未认领款转成待确认本金与预收费用（净值中性），份额仍由既有月末
+  流程发行；原路退款把未认领款转为应付款、按既有付款队列执行，只退原付款人原金额，幂等键由
+  「基金 + 上游流水 ID」派生。两者都要求非空理由与版本原子校验（CAS），`live=false` 时只允许预览。
+
+### 4.4 控制用户与机构收付
+
+`FundLedger(..., control_user_id=...)` 按实际站点作者/付款人 ID 判断控制用户。
+控制用户转账自动建立免手续费机构本金记录，沿用月末发行；其他用户的 5% 申购费
+在发行后转为 `subscription_fee` 应付款。`queue_institution_fees` 可为旧的已发行、仍在账
+费用补队列；生产调用由 `PaymentsWorker.drain_institution_fees` 的 live 闸门控制。
+
+`control_finances(user_id)` 只接受控制用户，返回两基金账务分类及机构费用累计收付；
+私聊 `/check` 使用此接口。普通持有人查询与公开频道过滤保持原权限。
+两个基金账号及控制用户必须各自不同。配置、升级边界与完整字段见
+[CONTROL_USER.md](../design/CONTROL_USER.md)。
 
 ## 5. 存储
 
@@ -196,6 +215,7 @@ python tools/run_capital_service.py --config <config.yaml> serve <根入口的�
 | `outage_failure_threshold` | `3` | 连续失败几次判定断线 |
 | `log_max_bytes` | `10485760` | 单段日志字节上限，超出即轮转 |
 | `log_backup_count` | `10` | 滚动日志保留段数 |
+| `control_user_id` | 空 | 共用机构控制用户站点 ID；非空 YAML 优先，否则读取 `FUNDS_CONTROL_USER_ID` |
 | `control_token` | 空 | 见 §7；来自 `FUNDS_CONTROL_TOKEN` 或数据目录 `admin.token`，长度 `>= 24` |
 
 **兼容别名**（旧键名会被规范化，不必改配置也能读）：
@@ -280,6 +300,15 @@ curl -sS -b cookie.jar http://127.0.0.1:8137/api/status
 | `POST` | `/api/funds/{fund_id}/settle` | 手动结算（`kind: month`/`emergency`） |
 | `POST` | `/api/dividend-choice` | 设置某持有人的分红复投比例 |
 | `POST` | `/api/backup` | 触发一次运行中的备份 |
+| `GET` | `/api/unclaimed` | 未认领款列表（`fund_id`、`status` 过滤，返回筛选后的笔数与合计） |
+| `GET` | `/api/funds/{fund_id}/unclaimed/{unclaimed_id}` | 单笔未认领款明细（到账要素、候选申购单、核对历史、版本） |
+| `POST` | `/api/funds/{fund_id}/unclaimed/{unclaimed_id}/preview` | 人工处理预览（`{action, subscription_id?}`），只读、无账务副作用 |
+| `POST` | `/api/funds/{fund_id}/unclaimed/{unclaimed_id}/resolve` | 提交人工处理（`{action, subscription_id?, version, reason}`），版本原子校验 |
+
+未认领款的人工核对（原路退款 / 关联已有申购单）在控制台单独面板完成，操作步骤见
+[UNCLAIMED_REVIEW.md](UNCLAIMED_REVIEW.md)，接口与口径见
+[人工核对设计](../design/UNCLAIMED_REVIEW.md)。要点：`actor` 由服务端从会话派生，
+请求体不接受金额、付款人和时间；`live=false` 时预览照常、提交以 `live_required` 拒绝。
 
 所有响应都会递归剔除疑似密钥的键；统一附加 `Content-Security-Policy`、
 `X-Content-Type-Options: nosniff`、`X-Frame-Options: DENY`、`Referrer-Policy:
@@ -314,7 +343,7 @@ python -m pytest tests/test_ledger.py::test_example_month_dividends_match_plan -
 
 1. **先研究**。新的入场/出场条件、仓位公式、风控阈值都必须先有独立的研究与回测
    （数据范围、成交假设、手续费、滑点、样本外与压力情形），结论写进
-   [INTRODUCTION.md](INTRODUCTION.md) 与 `docs/research/`。
+   [INTRODUCTION.md](../funds/INTRODUCTION.md) 与 `docs/materials/research/`。
 2. **再冻结**。研究通过后才把参数落到 `contracts.py::FundPolicy` / `POLICIES`，并把
    冻结口径写进文档；历史研究的结果**不能**当作新规则的证据，新旧口径必须分开表述。
 3. **然后实现**。纯规则改 `strategy.py` / `包内支持模块/hourly_signals.py`；涉及外部副作用的

@@ -3,9 +3,10 @@
 面向**研究/评审读者**：两条基金（capital1 温和增长 · ER12 与 capital2 激进增长 · 5 倍）用的
 是什么策略、冻结规则长什么样、历史研究给出了什么数字、这些数字能说明什么、**不能**说明什么。
 
-- 产品与费用规则请看 [GUIDE.md](GUIDE.md)（投资人向）；部署与运维看 [DEPLOYMENT.md](DEPLOYMENT.md)；
-  开发契约、测试与「改策略前必须先做什么」看 [USAGE.md](USAGE.md)。
-- 原始数字与图表来源说明在 [research/](research/)，配图在 `assets/`。
+- 产品与费用规则请看 [GUIDE.md](../usage/GUIDE.md)（投资人向）；部署与运维看 [DEPLOYMENT.md](../usage/DEPLOYMENT.md)；
+  开发契约、测试与「改策略前必须先做什么」看 [USAGE.md](../usage/USAGE.md)。
+- 下文 `research/` 表示仓库的 `docs/materials/research/`，`assets/` 表示 `docs/materials/assets/`。
+- 原始数字与图表来源说明在 [research/](../materials/research/)，配图在 `assets/`。
 - 本文所有金额、比率、回撤、交易数**全部照抄自** `research/evidence.json` 与
   `research/annual_comparison.json`，没有二次推算，也没有新的回测。
 
@@ -67,7 +68,7 @@ close_drawdown_pct / total_assets / net_profit`）。图的横轴是研究区间
 
 ### 2.1 资产与单位净值轨迹
 
-![两条基金的总资产与交易桶单位净值历史轨迹](assets/historical_growth.png)
+![两条基金的总资产与交易桶单位净值历史轨迹](../materials/assets/historical_growth.png)
 
 上图是**总资产**（对数轴，灰虚线为累计外部投入），下图是**交易桶单位净值**。两张子图看的是
 两个不同的东西，混着读会得出错误结论：
@@ -85,7 +86,7 @@ close_drawdown_pct / total_assets / net_profit`）。图的横轴是研究区间
 
 ### 2.2 日终回撤与停机线
 
-![两条基金日终交易桶单位净值回撤；虚线为 25% / 70% 停机阈值](assets/historical_drawdowns.png)
+![两条基金日终交易桶单位净值回撤；虚线为 25% / 70% 停机阈值](../materials/assets/historical_drawdowns.png)
 
 纵轴是**日终交易桶单位净值回撤**（越向下越深），两条水平虚线是各自 25% / 70% 的永久停机阈值，
 图中仅保留日终观测点，回撤峰值基于4秒收盘序列；汇总表中的收盘最大回撤统计全部4秒观测。三点需要区分：
@@ -102,7 +103,7 @@ close_drawdown_pct / total_assets / net_profit`）。图的横轴是研究区间
 
 ### 2.3 年度独立档（不同入场年份）
 
-![两条基金在各年度独立启动的结果](assets/annual_cohorts.png)
+![两条基金在各年度独立启动的结果](../materials/assets/annual_cohorts.png)
 
 **各年度独立启动**（`context = annual_fresh`）：每年 1 月 1 日投 1000、其后 11 个月每月 1000，
 全年新增出资 12000，**每年重新起跑、账户不连续**。它回答的是「如果我在那一年入场，那一年会
@@ -114,7 +115,7 @@ close_drawdown_pct / total_assets / net_profit`）。图的横轴是研究区间
 
 ### 2.4 执行压力敏感性
 
-![正常 vs 费用翻倍 + 额外 8 秒延迟](assets/execution_stress.png)
+![正常 vs 费用翻倍 + 额外 8 秒延迟](../materials/assets/execution_stress.png)
 
 左图是资金加权年化（XIRR），右图是盘中回撤保守上界，蓝柱正常、橙柱「费用翻倍 + 额外 8 秒」。
 capital1 的 XIRR 从 39.05% 降到 32.81%、盘中回撤上界从 23.93% 升到 24.49%；capital2 的 XIRR
@@ -248,7 +249,7 @@ capital1 的 XIRR 从 39.05% 降到 32.81%、盘中回撤上界从 23.93% 升到
 只看胜率会得出与 PF 完全相反的评价。capital1 的 ER12 门进一步压低了「亏完之后立刻回头
 再亏一次」的概率；H570 没有这道门，正常情景 PF 1.3742、`daily_pauses = 550`
 （capital1 侧未单列 `daily_pauses`，两者不能直接比较暂停次数）。
-逐项数字见 [historical_evidence.md](research/historical_evidence.md) §5。
+逐项数字见 [historical_evidence.md](../materials/research/historical_evidence.md) §5。
 
 ---
 
@@ -384,8 +385,8 @@ capital1 提供 12 个事件窗口（`context = continuous`），**capital2 一�
 
 ## 7. 投资人经济：分红、基准 H 与利润池 R
 
-历史研究**没有**模拟 v0.3 的资金规则。下面这套规则只存在于产品设计（[GUIDE.md](GUIDE.md) 与
-[docs/FUND_PLAN_V0.3.md](FUND_PLAN_V0.3.md)），**没有历史回测**：
+历史研究**没有**模拟 v0.3 的资金规则。下面这套规则只存在于产品设计（[GUIDE.md](../usage/GUIDE.md) 与
+[FUND_PLAN_V0.3.md](FUND_PLAN_V0.3.md)），**没有历史回测**：
 
 - **月度窗口**：每月 1 日至 25 日 18:00（北京时）提交申购/普通赎回；25 日 18:00 为到账与撤回截止；
   月末 23:59:59 统一估值与登记；次月前 3 个工作日核账确认；普通赎回确认后 5 个工作日内付款。
@@ -530,10 +531,10 @@ H570 没有连续年度切片，G12 没有 2017 年的独立档（行情自 2017
 
 | 文档 | 内容 |
 | --- | --- |
-| [research/README.md](research/README.md) | 研究材料索引、字段字典、引用规则 |
-| [research/strategy_protocol.md](research/strategy_protocol.md) | 冻结策略协议细则（含代码位置） |
-| [research/historical_evidence.md](research/historical_evidence.md) | 完整历史数据表（情景 / 年度 / 事件）与敏感性 |
-| [research/fund_vs_research_gap.md](research/fund_vs_research_gap.md) | 历史研究口径 vs v0.3 基金口径的差异与缺口 |
-| [GUIDE.md](GUIDE.md) | 投资人向规则：命令、费用、窗口、分红、豁免 |
-| [docs/FUND_PLAN_V0.3.md](FUND_PLAN_V0.3.md) | 计划草案原文 |
-| [DEPLOYMENT.md](DEPLOYMENT.md) / [USAGE.md](USAGE.md) | 部署运维 / 开发契约与「改策略前」的前置条件 |
+| [research/README.md](../materials/research/README.md) | 研究材料索引、字段字典、引用规则 |
+| [research/strategy_protocol.md](../materials/research/strategy_protocol.md) | 冻结策略协议细则（含代码位置） |
+| [research/historical_evidence.md](../materials/research/historical_evidence.md) | 完整历史数据表（情景 / 年度 / 事件）与敏感性 |
+| [research/fund_vs_research_gap.md](../materials/research/fund_vs_research_gap.md) | 历史研究口径 vs v0.3 基金口径的差异与缺口 |
+| [GUIDE.md](../usage/GUIDE.md) | 投资人向规则：命令、费用、窗口、分红、豁免 |
+| [FUND_PLAN_V0.3.md](FUND_PLAN_V0.3.md) | 计划草案原文 |
+| [DEPLOYMENT.md](../usage/DEPLOYMENT.md) / [USAGE.md](../usage/USAGE.md) | 部署运维 / 开发契约与「改策略前」的前置条件 |

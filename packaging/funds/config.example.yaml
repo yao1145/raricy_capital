@@ -19,8 +19,11 @@ host: 127.0.0.1
 port: 8137
 site_url: https://raricy.com
 # 外部写总闸：默认 false（只读预览：不下单、不转账、不发私聊）。确需真实操作时改为
-# true，或改用 CLI 的 --live 开关（两者任一为真即生效）；见 docs/DEPLOYMENT.md「只读优先」。
+# true，或改用 CLI 的 --live 开关（两者任一为真即生效）；见 docs/usage/DEPLOYMENT.md「只读优先」。
 live: false
+# 两只基金共用的机构控制用户站点 ID；空值关闭，或从 FUNDS_CONTROL_USER_ID 读取。
+# 必须与两个基金交易账号不同；实际 ID 仅写在本机配置副本或服务器环境中。
+control_user_id: ""
 tick_seconds: 4
 backup_interval_seconds: 3600
 backup_retention: 72

@@ -32,7 +32,35 @@ NOTICE_SENT = 'sent'
 # Payout rows we are willing to re-drive on a later tick.
 PAYOUT_OPEN_STATUSES = {'pending', 'approved', 'ready', None}
 
+# Manual unclaimed-receipt refunds. They are ordinary payout rows of a fixed
+# kind, driven by their own guarded path: available-cash gate, persisted
+# sending/uncertain intent and outgoing-ledger reconciliation before any replay.
+MANUAL_REFUND_KIND = 'unclaimed_refund'
+INSTITUTION_FEE_KIND = 'subscription_fee'
+GUARDED_PAYOUT_KINDS = {MANUAL_REFUND_KIND, INSTITUTION_FEE_KIND}
+MANUAL_REFUND_DONE = {'paid', 'cancelled'}
+MANUAL_REFUND_UNSETTLED = {'sending', 'uncertain'}
+
 MAX_PAGES = 20  # per fund, per tick
+
+
+def _as_int(value):
+    if value is None or isinstance(value, bool):
+        return None
+    return value if type(value) is int else None
+
+
+def manual_refund_payouts(store, fund_id: str | None = None) -> list[dict]:
+    """Queued manual refunds that have not reached a final state yet."""
+    prefix = f'{fund_id}:' if fund_id else ''
+    out = []
+    for _, payout in store.list_items('payouts', prefix):
+        if get_field(payout, 'kind') != MANUAL_REFUND_KIND:
+            continue
+        if get_field(payout, 'status') in MANUAL_REFUND_DONE:
+            continue
+        out.append(payout)
+    return sorted(out, key=lambda r: get_field(r, 'created_ms') or 0)
 
 
 def get_field(obj, name, default=None):
@@ -455,7 +483,7 @@ class PaymentsWorker:
     # ---- tick -----------------------------------------------------------
     async def tick(self, now_ms: int) -> dict:
         result = {'received': 0, 'expired': None, 'paid': 0, 'notices': None,
-                  'errors': [], 'online': True}
+                  'refunds': None, 'errors': [], 'online': True}
         try:
             result['received'] = await self.poll_payments(now_ms, result['errors'])
         except Exception as exc:
@@ -468,6 +496,22 @@ class PaymentsWorker:
             result['paid'] = await self.drain_payouts(now_ms)
         except Exception as exc:
             result['errors'].append(f'payout:{type(exc).__name__}')
+        try:
+            result['refunds'] = await self.drain_manual_refunds(now_ms)
+        except Exception as exc:
+            # A stuck manual refund is surfaced on its own row and in the audit
+            # trail; it must not raise a fund-wide trading hold by landing in
+            # ``errors`` (the runtime turns those into ``reconciliation_holds``).
+            self.store.append_event('manual_refunds_drain_failed', level='error',
+                                    details={'error': type(exc).__name__}, created_ms=now_ms)
+            result['refunds'] = {'seen': 0, 'paid': 0, 'reconciled': 0, 'held': 0,
+                                 'waiting': 0, 'skipped': 0, 'error': type(exc).__name__}
+        try:
+            result['institution_fees'] = await self.drain_institution_fees(now_ms)
+        except Exception as exc:
+            self.store.append_event('institution_fees_failed', level='error',
+                                    details={'error': type(exc).__name__}, created_ms=now_ms)
+            result['institution_fees'] = {'error': type(exc).__name__}
         try:
             result['notices'] = await self.outbox.deliver(
                 self._client_for, live=self.live, now_ms=now_ms)
@@ -533,6 +577,9 @@ class PaymentsWorker:
             'amount_units': amount,
             'note': get_field(tx, 'note') or '',
             'occurred_ms': occurred,
+            # The authoritative site row id is kept so a later verification can
+            # look the receipt up directly instead of rescanning the ledger.
+            'transaction_row_id': _as_int(get_field(tx, 'id')),
         }
 
     def _ingest(self, fund_id: str, tx, now_ms: int) -> bool:
@@ -625,6 +672,10 @@ class PaymentsWorker:
         for payout in payouts:
             if get_field(payout, 'status') not in PAYOUT_OPEN_STATUSES:
                 continue
+            if get_field(payout, 'kind') in GUARDED_PAYOUT_KINDS:
+                # Only the guarded manual-refund path may drive these: it adds the
+                # available-cash gate and the reconciliation pass this loop lacks.
+                continue
             fund_id = get_field(payout, 'fund_id')
             client = self._client_for(fund_id)
             if client is None:
@@ -665,3 +716,237 @@ class PaymentsWorker:
                                         created_ms=now_ms)
                 # Leave the payout open: the identical key makes the retry safe.
         return paid
+
+    # ---- manual unclaimed-receipt refunds -------------------------------
+    async def drain_manual_refunds(self, now_ms: int) -> dict:
+        """Drive the queued original-payer refunds of reviewed unclaimed receipts.
+
+        Deliberately separate from :meth:`drain_payouts`: a manual refund is only
+        sent when the fund's *free* cash can cover it, the sending intent is
+        persisted before the external call, and an unsettled attempt is
+        reconciled against the outgoing ledger before the same business key may
+        be replayed (never a new key).
+        """
+        return await self._drain_guarded_payouts(now_ms, MANUAL_REFUND_KIND)
+
+    async def drain_institution_fees(self, now_ms: int) -> dict:
+        if self.live:
+            self.ledger.queue_institution_fees(now_ms)
+        return await self._drain_guarded_payouts(now_ms, INSTITUTION_FEE_KIND)
+
+    async def _drain_guarded_payouts(self, now_ms: int, kind: str) -> dict:
+        stats = {'seen': 0, 'paid': 0, 'reconciled': 0, 'held': 0, 'waiting': 0,
+                 'skipped': 0, 'error': None}
+        try:
+            payouts = [p for _, p in self.store.list_items('payouts', limit=None)
+                       if p.get('kind') == kind and p.get('status') not in MANUAL_REFUND_DONE]
+        except Exception as exc:
+            self.store.append_event('manual_refunds_failed', level='error',
+                                    details={'error': type(exc).__name__}, created_ms=now_ms)
+            stats['error'] = type(exc).__name__
+            return stats
+        stats['seen'] = len(payouts)
+        if not payouts:
+            return stats
+        if not self.live:
+            self.store.append_event('manual_refunds_held_not_live', level='info',
+                                    details={'pending': len(payouts)}, created_ms=now_ms)
+            return stats
+        for payout in payouts:
+            try:
+                outcome = await self._drive_manual_refund(payout, now_ms)
+            except Exception as exc:
+                # One broken payout must not stop the others; it stays open.
+                self.store.append_event('manual_refund_failed',
+                                        fund_id=get_field(payout, 'fund_id'), level='error',
+                                        details={'payout_id': get_field(payout, 'id'),
+                                                 'error': type(exc).__name__},
+                                        created_ms=now_ms)
+                outcome = 'held'
+            if outcome in stats:
+                stats[outcome] += 1
+        return stats
+
+    @staticmethod
+    async def _manual_balance(client) -> int:
+        wallet = await client.balance()
+        if isinstance(wallet, bool) or not isinstance(wallet, int) or wallet < 0:
+            raise ValueError('invalid_balance')
+        return wallet
+
+    async def _drive_manual_refund(self, payout, now_ms: int) -> str:
+        fund_id = get_field(payout, 'fund_id')
+        payout_id = get_field(payout, 'id')
+        client = self._client_for(fund_id)
+        if client is None:
+            return 'skipped'
+        if get_field(payout, 'status') in MANUAL_REFUND_UNSETTLED:
+            verdict = await self._reconcile_manual_refund(client, payout, now_ms)
+            if verdict == 'paid':
+                return 'reconciled'
+            if verdict != 'retry_ok':
+                # Either two rows carry this refund's exact fingerprint, or the
+                # confirmed result could not be recorded: a human must look before
+                # anything else is sent.
+                return 'held'
+            # Not confirmed: the payout stays unknown and the *same* key may be
+            # replayed (the site de-duplicates it, so this can never pay twice).
+        try:
+            actual_cash = await self._manual_balance(client)
+        except Exception:
+            self.ledger.mark_payout_waiting(payout_id, 'balance_unavailable', now_ms)
+            return 'waiting'
+        cash = self.ledger.manual_refund_cash(payout_id, wallet_units=actual_cash)
+        if not cash.get('ok'):
+            self.ledger.mark_payout_waiting(payout_id, cash.get('reason') or 'cash_unavailable',
+                                            now_ms)
+            return 'waiting'
+        # Durable intent before the external write, so a crash is recoverable.
+        self.ledger.mark_payout_sending(payout_id, now_ms)
+        return await self._send_manual_refund(client, payout, now_ms)
+
+    async def _send_manual_refund(self, client, payout, now_ms: int) -> str:
+        fund_id = get_field(payout, 'fund_id')
+        payout_id = get_field(payout, 'id')
+        user_id = get_field(payout, 'user_id')
+        amount_units = _as_int(get_field(payout, 'amount_units')) or 0
+        note = str(get_field(payout, 'note') or '')
+        key = get_field(payout, 'idempotency_key') or str(payout_id)
+        try:
+            result = await client.transfer(user_id, amount_units, note, key)
+        except Exception as exc:
+            self._manual_refund_uncertain(payout, 'transfer_error', now_ms,
+                                          error=type(exc).__name__)
+            return 'held'
+        transfer_id = get_field(result, 'transfer_id')
+        paid_units = _as_int(get_field(result, 'amount_units'))
+        if (not result or not isinstance(transfer_id, str) or not transfer_id
+                or paid_units != amount_units):
+            # An empty or mismatched result is not proof of payment: leave the
+            # intent open instead of clearing the liability.
+            self._manual_refund_uncertain(payout, 'unconfirmed_transfer_result', now_ms)
+            return 'held'
+        try:
+            wallet = await self._manual_balance(client)
+            self.ledger.mark_payout_paid(payout_id, transfer_id, now_ms, wallet_units=wallet)
+        except Exception as exc:
+            self.ledger.mark_payout_uncertain(payout_id, 'confirmation_unavailable', now_ms)
+            self.store.append_event('manual_refund_mark_failed', fund_id=fund_id, level='error',
+                                    details={'payout_id': payout_id,
+                                             'error': type(exc).__name__}, created_ms=now_ms)
+            return 'held'
+        return 'paid'
+
+    def _manual_refund_uncertain(self, payout, reason: str, now_ms: int,
+                                 error: str | None = None) -> None:
+        payout_id = get_field(payout, 'id')
+        fund_id = get_field(payout, 'fund_id')
+        user_id = get_field(payout, 'user_id')
+        self.ledger.mark_payout_uncertain(payout_id, reason, now_ms)
+        details = {'payout_id': payout_id, 'reason': reason}
+        if error:
+            details['error'] = error
+        self.store.append_event('manual_refund_uncertain', fund_id=fund_id, level='warning',
+                                details=details, created_ms=now_ms)
+        self.outbox.enqueue(
+            fund_id, ('机构手续费转账状态待确认，我们正在核对，不会重复支付。'
+                      if get_field(payout, 'kind') == INSTITUTION_FEE_KIND else
+                      '未认领款退款处理状态待确认，我们正在核对，不会重复支付。'),
+            user_id=user_id, event_id=f'manual-refund-uncertain:{payout_id}', now_ms=now_ms)
+
+    # ---- outgoing-ledger reconciliation ---------------------------------
+    async def _reconcile_manual_refund(self, client, payout, now_ms: int) -> str:
+        """Did the uncertain refund already leave the fund account?
+
+        Only a *complete* bounded scan with exactly one outgoing row matching the
+        recipient, the amount and the deterministic note confirms payment.  The
+        payment polling cursor is never read or advanced here, and no result is
+        ever treated as proof of *absence* beyond what a finished scan shows.
+        """
+        row_id = _as_int(get_field(payout, 'transaction_row_id'))
+        if row_id and row_id > 0:
+            scan = await self._scan_outgoing(client, row_id - 1)
+            return await self._judge_refund_scan(client, payout, scan, now_ms)
+        scan = await self._scan_outgoing(client, 0)
+        return await self._judge_refund_scan(client, payout, scan, now_ms)
+
+    async def _scan_outgoing(self, client, since_id: int) -> dict:
+        cursor = max(0, int(since_id))
+        rows: list = []
+        complete = False
+        error = None
+        for _ in range(MAX_PAGES):
+            try:
+                page = await client.transactions(cursor)
+            except Exception as exc:
+                error = type(exc).__name__
+                break
+            for tx in list(get_field(page, 'transactions', []) or []):
+                rows.append(tx)
+            nxt = _as_int(get_field(page, 'next_cursor', cursor))
+            if nxt is None or nxt < cursor:
+                nxt = cursor
+            cursor = nxt
+            if not get_field(page, 'has_more', False):
+                complete = True
+                break
+        return {'rows': rows, 'complete': complete, 'error': error}
+
+    @staticmethod
+    def _refund_matches(row, payout) -> bool:
+        """The immutable fingerprint of one outgoing refund (never the note alone).
+
+        Amount magnitude and note identify possible candidates. Confirmation then
+        requires a complete scan and the exact recipient; a missing recipient is
+        held as uncertainty rather than treated as proof of absence.
+        """
+        if get_field(row, 'type') != 'transfer':
+            return False
+        amount = _as_int(get_field(row, 'amount_units'))
+        expected_units = _as_int(get_field(payout, 'amount_units')) or 0
+        if amount is None or abs(amount) != expected_units:
+            return False
+        expected = ' '.join(str(get_field(payout, 'note') or '').split())
+        if not expected or ' '.join(str(get_field(row, 'note') or '').split()) != expected:
+            return False
+        recipient = get_field(row, 'to_user_id')
+        if recipient is not None and str(recipient) != str(get_field(payout, 'user_id')):
+            return False
+        return True
+
+    async def _judge_refund_scan(self, client, payout, scan: dict, now_ms: int) -> str:
+        """Confirm only a complete unique fingerprint; otherwise hold uncertainty."""
+        payout_id = get_field(payout, 'id')
+        if scan.get('error'):
+            self.ledger.mark_payout_uncertain(payout_id, 'reconcile_scan_failed', now_ms)
+            return 'error'
+        if not scan.get('complete'):
+            self.ledger.mark_payout_uncertain(payout_id, 'reconcile_incomplete', now_ms)
+            return 'incomplete'
+        candidates = [row for row in scan['rows'] if self._refund_matches(row, payout)]
+        if len(candidates) > 1:
+            self.ledger.mark_payout_uncertain(payout_id, 'reconcile_ambiguous', now_ms)
+            self.store.append_event('manual_refund_reconcile_ambiguous',
+                fund_id=get_field(payout, 'fund_id'), level='error',
+                details={'payout_id': payout_id, 'matches': len(candidates)}, created_ms=now_ms)
+            return 'ambiguous'
+        if candidates:
+            row = candidates[0]
+            recipient = get_field(row, 'to_user_id')
+            transfer_id = get_field(row, 'transfer_id')
+            if (not isinstance(recipient, str) or not recipient
+                    or recipient != get_field(payout, 'user_id')
+                    or not isinstance(transfer_id, str) or not transfer_id):
+                self.ledger.mark_payout_uncertain(payout_id, 'reconcile_unidentified', now_ms)
+                return 'incomplete'
+            try:
+                wallet = await self._manual_balance(client)
+                self.ledger.mark_payout_paid(payout_id, transfer_id, now_ms, wallet_units=wallet)
+            except Exception as exc:
+                self.ledger.mark_payout_uncertain(payout_id, 'confirmation_unavailable', now_ms)
+                self.store.append_event('manual_refund_mark_failed',
+                    fund_id=get_field(payout, 'fund_id'), level='error',
+                    details={'payout_id': payout_id, 'error': type(exc).__name__}, created_ms=now_ms)
+                return 'error'
+            return 'paid'
+        return 'retry_ok'

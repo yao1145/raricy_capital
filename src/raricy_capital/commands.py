@@ -8,7 +8,7 @@ Safety rules:
   * a message id is claimed durably so a redelivered message is handled once;
   * amounts are parsed strictly (positive, at most 4 decimals) as integer
     1e-4 units — never floats;
-  * ``/check`` reads only the caller's own holder view;
+  * ordinary ``/check`` reads the caller's holdings; only the configured verified controller sees all fund categories;
   * the reply (and any QR image) is queued in the durable notice outbox before
     any external send, and external sends are gated by ``live`` (default False).
 """
@@ -234,6 +234,26 @@ class CommandHandler:
 
     # ---- /check ---------------------------------------------------------
     def _check(self, user_id: str, now: int) -> str:
+        if callable(getattr(self.ledger, 'is_control_user', None)) and self.ledger.is_control_user(user_id):
+            lines = ['【控制用户资金总览】', '金额单位：小鱼干；依据最近账簿快照，不查询控制账户外部钱包。']
+            for value in self.ledger.control_finances(user_id):
+                lines += [f"\n【{value['label']} · {value['fund_id']}】",
+                          f"状态：{_STATE_TEXT.get(value['state'], value['state'])} · 净值 {value['nav']}",
+                          f"在外份额：{shares_text(value['shares_atoms'])}",
+                          f"控制用户份额：{shares_text(value['user_shares_atoms'])} · 估值 {money_text(value['user_value_units'])}"]
+                fields = [('账户钱包', 'wallet_units'), ('持仓净价值', 'position_value_units'),
+                          ('基金净资产', 'equity_units'), ('可用现金', 'available_cash_units'),
+                          ('控制用户累计登记本金', 'control_capital_units'), ('初始登记本金', 'seeded_units'),
+                          ('待确认本金', 'pending_receipts_units'), ('未转出预收/历史费用', 'fee_balance_units'),
+                          ('应付款负债', 'liabilities_units'), ('未认领款', 'unclaimed_units'),
+                          ('已实现交易利润', 'realized_profit_units'), ('累计净资本流入', 'capital_flows_units'),
+                          ('机构手续费已转出', 'institution_fee_paid_units'),
+                          ('机构手续费待转出', 'institution_fee_pending_units'),
+                          ('其中结果未知', 'institution_fee_unknown_units')]
+                lines += [f"{label}：{money_text(value[key])}" for label, key in fields]
+                lines.append(f"估值时间：{timestamp_text(value['quote_ms']) if value['quote_ms'] else '暂无有效估值'}")
+            lines += ['\n预收费用可退款；待转出手续费包含结果未知部分。累计登记本金不代表当前可取余额。']
+            return '\n'.join(lines)
         status = self.ledger.status(self.fund_id, user_id=user_id) or {}
         label = get_field(status, 'label', self.fund_id)
         nav = get_field(status, 'nav', '-')

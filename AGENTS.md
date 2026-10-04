@@ -1,6 +1,6 @@
 # 协作约定
 
-本文件适用于整个项目。开发说明见[USAGE.md](docs/USAGE.md)，Claude Code工作说明见[CLAUDE.md](CLAUDE.md)。
+本文件适用于整个项目。开发说明见[USAGE.md](docs/usage/USAGE.md)，Claude Code工作说明见[CLAUDE.md](CLAUDE.md)。
 
 ## 工作方式
 

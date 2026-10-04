@@ -85,6 +85,105 @@
       <ul class="log-list" id="orders-list"></ul>
     </div>
   </section>
+
+  <section class="unclaimed-section" aria-labelledby="unclaimed-title">
+    <div class="card panel">
+      <header class="panel-head">
+        <h2 id="unclaimed-title">未认领款人工核对</h2>
+        <div class="panel-tools">
+          <span class="badge" id="unclaimed-mode" data-state="unknown">模式未知</span>
+          <label class="sr-only" for="unclaimed-fund-filter">按基金筛选未认领款</label>
+          <select id="unclaimed-fund-filter">
+            <option value="">全部基金</option>
+          </select>
+          <label class="sr-only" for="unclaimed-status-filter">按状态筛选未认领款</label>
+          <select id="unclaimed-status-filter">
+            <option value="">全部状态</option>
+            <option value="unclaimed">待核对</option>
+            <option value="linked">已关联</option>
+            <option value="refund_queued">退款排队</option>
+            <option value="refund_unknown">退款待对账</option>
+            <option value="refunded">已退款</option>
+          </select>
+          <button type="button" class="btn small ghost" id="unclaimed-refresh">刷新</button>
+        </div>
+      </header>
+
+      <p class="unclaimed-summary" id="unclaimed-summary">加载中…</p>
+      <ul class="unclaimed-list" id="unclaimed-list"></ul>
+
+      <section class="unclaimed-detail" id="unclaimed-detail" hidden>
+        <header class="unclaimed-detail-head">
+          <div>
+            <h3 id="unclaimed-detail-title">未认领流水详情</h3>
+            <p class="hint" id="unclaimed-detail-sub"></p>
+          </div>
+          <div class="unclaimed-detail-tools">
+            <span class="badge" id="unclaimed-status-badge" data-state="unknown">状态未知</span>
+            <button type="button" class="btn small ghost" id="unclaimed-close">关闭详情</button>
+          </div>
+        </header>
+
+        <dl class="unclaimed-fields" id="unclaimed-fields"></dl>
+
+        <div class="unclaimed-block">
+          <h4>候选申购单</h4>
+          <ul class="unclaimed-candidates" id="unclaimed-candidates"></ul>
+        </div>
+
+        <div class="unclaimed-block">
+          <h4>核对历史</h4>
+          <ul class="unclaimed-history" id="unclaimed-history"></ul>
+        </div>
+
+        <form class="unclaimed-form" id="unclaimed-form" autocomplete="off">
+          <fieldset class="unclaimed-actions">
+            <legend>处理方式</legend>
+            <label class="check">
+              <input type="radio" name="unclaimed-action" id="unclaimed-action-link" value="link" checked>
+              <span>关联已有申购单（不修改金额、到账时间与付款人）</span>
+            </label>
+            <label class="check">
+              <input type="radio" name="unclaimed-action" id="unclaimed-action-refund" value="refund">
+              <span>原路全额退款（只生成付款队列并跟踪进度，不直接转账）</span>
+            </label>
+          </fieldset>
+
+          <p class="hint" id="unclaimed-candidate-hint"></p>
+
+          <label class="field unclaimed-reason-field">
+            <span>处理理由（必填，最多 500 字，会写入审计记录）</span>
+            <textarea id="unclaimed-reason" name="reason" rows="3" maxlength="500" required
+              placeholder="例如：与用户核对后确认附言漏填订单号，付款人、金额与到账时间与订单一致"></textarea>
+          </label>
+
+          <div class="unclaimed-form-actions">
+            <button type="submit" class="btn small" id="unclaimed-preview-btn">核对预览</button>
+            <span class="hint" id="unclaimed-draft-note" hidden></span>
+          </div>
+          <p class="error" id="unclaimed-error" role="alert" hidden></p>
+        </form>
+
+        <section class="unclaimed-preview" id="unclaimed-preview" hidden>
+          <h4>预览结果</h4>
+          <p class="status-line" id="unclaimed-preview-verdict" data-tone="unknown"></p>
+          <ul class="unclaimed-errors" id="unclaimed-preview-errors"></ul>
+          <dl class="unclaimed-fields" id="unclaimed-preview-fields"></dl>
+
+          <div class="unclaimed-confirm">
+            <h4>最终确认</h4>
+            <ul class="unclaimed-confirm-list" id="unclaimed-confirm-list"></ul>
+            <p class="hint" id="unclaimed-live-hint" hidden></p>
+            <label class="check">
+              <input type="checkbox" id="unclaimed-confirm-check">
+              <span>我已按权威到账记录核对付款人、金额、关联订单与处理理由，确认提交。</span>
+            </label>
+            <button type="button" class="btn small primary" id="unclaimed-resolve-btn" disabled>确认提交处理</button>
+          </div>
+        </section>
+      </section>
+    </div>
+  </section>
 </main>
 
 <template id="fund-card-template">

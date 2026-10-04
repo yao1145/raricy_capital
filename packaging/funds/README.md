@@ -25,7 +25,7 @@ unit / 计划任务 / 用户 / 目录名沿用 `raricy-funds`（旧 8127 用的�
   `loopback_required` 拒绝；远程访问一律经 SSH 隧道（`-L`）。
 - **只读优先**：`live` 默认 `false`。非 live 时一切外部写（下单、转账、发私聊）都被
   拒绝，服务只做本地账务与预览；确需真实操作时再显式打开（`live: true` 或 CLI
-  `--live`），详见 `docs/DEPLOYMENT.md` §5。
+  `--live`），详见 `docs/usage/DEPLOYMENT.md` §5。
 - **密钥不进物料**：unit、任务、脚本、迁移包里都不含凭据。Linux 用
   `/etc/raricy-funds/funds.env`（仓库外的 0600/0640 文件）；Windows 用当前用户环境
   变量或独立凭据文件。仓库内只有 `*.example` 占位符。变量一律保留 `FUNDS_` 前缀。
@@ -64,4 +64,4 @@ unit / 计划任务 / 用户 / 目录名沿用 `raricy-funds`（旧 8127 用的�
    （`~/.config/systemd/user/` + `systemctl --user enable --now`），浏览器访问
    `http://127.0.0.1:8137/`；Windows 运维机直接用文档里的 `ssh -L` 命令。
 
-完整的操作手册、迁移步骤与人工验收清单见 `docs/` 下的 [`docs/DEPLOYMENT.md`](../../docs/DEPLOYMENT.md)。
+完整的操作手册、迁移步骤与人工验收清单见 `docs/` 下的 [`docs/usage/DEPLOYMENT.md`](../../docs/usage/DEPLOYMENT.md)。

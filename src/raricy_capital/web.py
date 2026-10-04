@@ -25,6 +25,11 @@ Optional service hooks used when present (graceful empty fallback otherwise):
     async service.orders(fund_id, user_id) -> list[dict]
     async service.holders(fund_id) -> list[dict]
     async service.nav_history(fund_id, limit) -> list[dict]
+    service.unclaimed(fund_id=None, status=None) -> list[dict]
+    service.unclaimed_detail(fund_id, unclaimed_id) -> dict
+    async service.preview_unclaimed(fund_id, unclaimed_id, action, subscription_id=None) -> dict
+    async service.resolve_unclaimed(fund_id, unclaimed_id, action, *, version, reason, actor,
+                                    subscription_id=None) -> dict
 
 Security model:
   * every request must carry a loopback Host header (DNS-rebinding guard);
@@ -33,14 +38,19 @@ Security model:
   * all ``/api/*`` routes except login/logout require the control token, either
     as bearer credentials or via a short local session cookie obtained from
     ``POST /api/login``;
-  * responses are recursively redacted for secret-looking keys.
+  * responses are recursively redacted for secret-looking keys;
+  * the unclaimed-review audit actor is derived server-side from whatever
+    credential authenticated the request: an opaque digest, never the session
+    cookie or control token itself, and never anything the caller sent.
 """
 from __future__ import annotations
 
+import hashlib
 import hmac
 import inspect
 import json
 import logging
+import re
 import secrets
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -58,6 +68,16 @@ SESSION_TTL_MS = 8 * 3600 * 1000
 WRITE_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
 AUTH_EXEMPT = frozenset({"/api/login", "/api/logout"})
 LOCAL_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
+UNCLAIMED_ACTIONS = ("link", "refund")
+UNCLAIMED_PREVIEW_FIELDS = frozenset({"action", "subscription_id"})
+UNCLAIMED_RESOLVE_FIELDS = frozenset({"action", "subscription_id", "version", "reason"})
+UNCLAIMED_STATUS_RE = re.compile(r"[a-z_]{1,32}\Z")
+UNCLAIMED_ID_RE = re.compile(r"[A-Za-z0-9_.:-]{1,64}\Z")
+UNCLAIMED_REASON_MAX = 500
+#: Truncated digest length: plenty to correlate a management session in the audit
+#: trail, short enough to stay a fixed-size opaque label.
+UNCLAIMED_ACTOR_DIGEST = 24
+
 SECRET_KEY_PARTS = (
     "password",
     "passwd",
@@ -281,6 +301,117 @@ def _fraction_field(body: dict, key: str) -> float:
     return float(value)
 
 
+# ------------------------------------------------- unclaimed review payloads
+
+
+def _reject_unknown_fields(body: dict, allowed: frozenset[str]) -> None:
+    """Strict allowlist: any authority-looking extra field is refused outright.
+
+    Amounts, payers, arrival times, verification results and the auditor identity
+    are all derived server-side; a caller that tries to supply them gets a 400
+    instead of silently having them ignored.
+    """
+    extra = sorted(set(body) - allowed)
+    if extra:
+        raise ApiFault(400, "invalid_field")
+
+
+def _action_field(body: dict) -> str:
+    action = body.get("action")
+    if not isinstance(action, str) or action not in UNCLAIMED_ACTIONS:
+        raise ApiFault(400, "invalid_action")
+    return action
+
+
+def _unclaimed_id(value: str | None) -> str:
+    if not isinstance(value, str) or UNCLAIMED_ID_RE.fullmatch(value) is None:
+        raise ApiFault(400, "invalid_field")
+    return value
+
+
+def _subscription_field(body: dict) -> str | None:
+    value = body.get("subscription_id")
+    if value is None:
+        return None
+    if not isinstance(value, str) or UNCLAIMED_ID_RE.fullmatch(value) is None:
+        raise ApiFault(400, "invalid_field")
+    return value
+
+
+def _reason_field(body: dict) -> str:
+    reason = body.get("reason")
+    if not isinstance(reason, str):
+        raise ApiFault(400, "invalid_field")
+    reason = reason.strip()
+    if not reason or len(reason) > UNCLAIMED_REASON_MAX:
+        raise ApiFault(400, "invalid_field")
+    return reason
+
+
+def _version_field(body: dict) -> int:
+    version = body.get("version")
+    if isinstance(version, bool) or not isinstance(version, int) or version < 0:
+        raise ApiFault(400, "invalid_field")
+    return version
+
+
+def _audit_actor(request: web.Request) -> str:
+    """Opaque, server-derived audit actor for a unclaimed-review resolution.
+
+    Derived from the credential that actually authenticated this request (control
+    token or short local session), never from the payload and never the raw
+    secret: a truncated SHA-256 digest with a kind prefix. It identifies a
+    management session for the audit trail without claiming to prove which
+    person was at the keyboard.
+    """
+    app = request.app
+    control = app[CONTROL_TOKEN_KEY]
+    credential = None
+    kind = None
+    header = request.headers.get("Authorization", "")
+    if header.startswith("Bearer "):
+        candidate = header[7:].strip()
+        if candidate and _token_matches(candidate, control):
+            credential, kind = candidate, "token"
+        elif candidate and _session_valid(app, candidate):
+            credential, kind = candidate, "session"
+    if credential is None:
+        cookie = request.cookies.get(COOKIE_NAME)
+        if cookie and _session_valid(app, cookie):
+            credential, kind = cookie, "session"
+    if credential is None:
+        # Unreachable through the auth middleware; an unauthenticated resolve must
+        # never be attributed to anyone.
+        raise ApiFault(401, "unauthorized")
+    digest = hashlib.sha256(f"{kind}:{credential}".encode("utf-8")).hexdigest()
+    return f"{kind}-{digest[:UNCLAIMED_ACTOR_DIGEST]}"
+
+
+def _unclaimed_listing(value: object) -> dict:
+    """Normalize ``{unclaimed, count, total_units}`` for the filtered set."""
+    rows = value
+    count = total = None
+    if isinstance(value, dict):
+        rows = value.get("unclaimed")
+        count = value.get("count")
+        total = value.get("total_units")
+    if not isinstance(rows, list):
+        rows = []
+    clean = [row for row in rows if isinstance(row, dict)]
+    if isinstance(count, bool) or not isinstance(count, int):
+        count = len(clean)
+    if isinstance(total, bool) or not isinstance(total, int):
+        total = sum(units for units in (_units_of(row) for row in clean) if units is not None)
+    return {"unclaimed": clean, "count": count, "total_units": total}
+
+
+def _units_of(row: dict) -> int | None:
+    units = row.get("amount_units")
+    if isinstance(units, bool) or not isinstance(units, int):
+        return None
+    return units
+
+
 # --------------------------------------------------------------------- routes
 
 
@@ -458,6 +589,82 @@ async def _api_backup(request: web.Request) -> web.StreamResponse:
     return web.json_response({"ok": True, "backup": name})
 
 
+async def _api_unclaimed(request: web.Request) -> web.StreamResponse:
+    service = request.app[SERVICE_KEY]
+    fund_id = request.query.get("fund_id") or None
+    if fund_id is not None:
+        _require_fund(fund_id)
+    status = request.query.get("status") or None
+    if status is not None and UNCLAIMED_STATUS_RE.fullmatch(status) is None:
+        raise ApiFault(400, "invalid_field")
+    target = service if hasattr(service, "unclaimed") else getattr(service, "ledger", None)
+    try:
+        rows = await _invoke_optional(target, "unclaimed", fund_id, status)
+    except FundError as exc:
+        raise ApiFault(400, exc.code) from None
+    return web.json_response(_sanitize(_unclaimed_listing(rows)))
+
+
+async def _api_unclaimed_detail(request: web.Request) -> web.StreamResponse:
+    service = request.app[SERVICE_KEY]
+    fund_id = _require_fund(request.match_info.get("fund_id", ""))
+    unclaimed_id = _unclaimed_id(request.match_info.get("unclaimed_id"))
+    if hasattr(service, "unclaimed_detail"):
+        target, args = service, (fund_id, unclaimed_id)
+    else:
+        target, args = getattr(service, "ledger", None), (fund_id, unclaimed_id, now_ms())
+    try:
+        detail = await _invoke_optional(target, "unclaimed_detail", *args)
+    except FundError as exc:
+        raise ApiFault(400, exc.code) from None
+    if detail is None:
+        raise ApiFault(404, "unclaimed_not_found")
+    if not isinstance(detail, dict):
+        raise ApiFault(500, "internal_error")
+    return web.json_response(_sanitize({"record": detail}))
+
+
+async def _api_unclaimed_preview(request: web.Request) -> web.StreamResponse:
+    service = request.app[SERVICE_KEY]
+    fund_id = _require_fund(request.match_info.get("fund_id", ""))
+    unclaimed_id = _unclaimed_id(request.match_info.get("unclaimed_id"))
+    body = await _json_body(request)
+    _reject_unknown_fields(body, UNCLAIMED_PREVIEW_FIELDS)
+    action = _action_field(body)
+    subscription_id = _subscription_field(body)
+    try:
+        preview = await _invoke(service, "preview_unclaimed", fund_id, unclaimed_id, action,
+                                subscription_id)
+    except FundError as exc:
+        raise ApiFault(400, exc.code) from None
+    cfg = _config_object(service)
+    return web.json_response(_sanitize({
+        "preview": preview if isinstance(preview, dict) else {},
+        "live": bool(_setting(service, cfg, "live", False)),
+    }))
+
+
+async def _api_unclaimed_resolve(request: web.Request) -> web.StreamResponse:
+    service = request.app[SERVICE_KEY]
+    fund_id = _require_fund(request.match_info.get("fund_id", ""))
+    unclaimed_id = _unclaimed_id(request.match_info.get("unclaimed_id"))
+    body = await _json_body(request)
+    _reject_unknown_fields(body, UNCLAIMED_RESOLVE_FIELDS)
+    action = _action_field(body)
+    subscription_id = _subscription_field(body)
+    version = _version_field(body)
+    reason = _reason_field(body)
+    # The auditor identity is never taken from the request body.
+    actor = _audit_actor(request)
+    try:
+        record = await _invoke(service, "resolve_unclaimed", fund_id, unclaimed_id, action,
+                               version=version, reason=reason, actor=actor,
+                               subscription_id=subscription_id)
+    except FundError as exc:
+        raise ApiFault(400, exc.code) from None
+    return web.json_response(_sanitize({"record": record if isinstance(record, dict) else {}}))
+
+
 def _add_routes(app: web.Application) -> None:
     app.router.add_get("/", _index)
     app.router.add_static("/static/", STATIC_DIR, name="static", show_index=False)
@@ -469,6 +676,15 @@ def _add_routes(app: web.Application) -> None:
     app.router.add_get("/api/events", _api_events)
     app.router.add_get("/api/holders", _api_holders)
     app.router.add_get("/api/funds/{fund_id}/nav-history", _api_nav_history)
+    # Unclaimed review: read-only list/detail, then preview and resolve.
+    # ``resolve`` needs the site re-read plus a ledger CAS; the audit actor is
+    # derived from the authenticated credential inside the handler.
+    app.router.add_get("/api/unclaimed", _api_unclaimed)
+    app.router.add_get("/api/funds/{fund_id}/unclaimed/{unclaimed_id}", _api_unclaimed_detail)
+    app.router.add_post("/api/funds/{fund_id}/unclaimed/{unclaimed_id}/preview",
+                        _api_unclaimed_preview)
+    app.router.add_post("/api/funds/{fund_id}/unclaimed/{unclaimed_id}/resolve",
+                        _api_unclaimed_resolve)
     app.router.add_post("/api/funds/{fund_id}/login", _api_login)
     app.router.add_post("/api/funds/{fund_id}/seed", _api_seed)
     app.router.add_post("/api/funds/{fund_id}/running", _api_running)

@@ -4,9 +4,9 @@
 运行、备份、迁移和验收 `src/raricy_capital` 这套 capital1 / capital2 资金服务。
 
 - 只讲**部署与运维**。产品规则、费用与窗口见 [`GUIDE.md`](GUIDE.md)；开发者环境与
-  模块结构见 [`USAGE.md`](USAGE.md)；项目背景见 [`INTRODUCTION.md`](INTRODUCTION.md)；
-  仓库总览见 [`README.md`](../README.md)。
-- 部署物料在 [`packaging/funds/`](../packaging/funds/README.md)。
+  模块结构见 [`USAGE.md`](USAGE.md)；项目背景见 [`INTRODUCTION.md`](../funds/INTRODUCTION.md)；
+  仓库总览见 [`README.md`](../../README.md)。
+- 部署物料在 [`packaging/funds/`](../../packaging/funds/README.md)。
 - 服务只监听 **127.0.0.1**，远程访问一律经 SSH 隧道；默认 **`live: false`（只读预览）**，
   真实下单 / 转账 / 私聊必须显式开启。
 
@@ -99,7 +99,7 @@ cryptography、`qrcode[pil]`）——本项目**没有** `[funds]` extra，脚�
 不是 JSON**：样例里的 `#` 注释在 JSON 里非法，整份样例按 JSON 解析会直接失败（加载器
 用 `yaml.safe_load`，它恰好也接受无注释的 JSON 子集，但请统一按 YAML 编辑）。
 
-样例见 [`packaging/funds/config.example.yaml`](../packaging/funds/config.example.yaml)；
+样例见 [`packaging/funds/config.example.yaml`](../../packaging/funds/config.example.yaml)；
 Linux 安装脚本会把它复制为 `/etc/raricy-funds/funds.yaml` 并把 `data_dir` 改写为
 `/var/lib/raricy-funds`。
 
@@ -110,6 +110,7 @@ Linux 安装脚本会把它复制为 `/etc/raricy-funds/funds.yaml` 并把 `data
 | `port` | `8137` | 1024–65535 |
 | `site_url` | `https://raricy.com` | 必须是 `https`，不得带凭据 / 查询串 / 片段，否则 `invalid_site_url` |
 | `live` | `false` | 外部写总闸，见 §5 |
+| `control_user_id` | 空 | 两基金共用的控制用户站点 ID；必须与两交易账号不同 |
 | `tick_seconds` | `4` | 主循环与健康探测间隔，1–60（离线判定是**敏感**的） |
 | `backup_interval_seconds` | `3600` | 服务内部备份周期，整数且 ≥ 60 |
 | `backup_retention` | `72` | 备份保留份数，1–10000 |
@@ -140,6 +141,23 @@ python -m raricy_capital --config /etc/raricy-funds/funds.yaml --backup # 停机
 
 ---
 
+### 3.1 启用控制用户
+
+在目标机私有 `funds.yaml` 添加 `control_user_id: "实际站点用户ID"`；也可在服务环境
+填写 `FUNDS_CONTROL_USER_ID`（只有 YAML 留空时采用）。该 ID 不是管理令牌；不需要
+控制用户的密码。两个基金继续各用自己的登录账号。账号冲突会报
+`control_user_cannot_be_fund_account`，不能忽略或换显示名绕过。
+
+本机已准备 Git 忽略的 `config.local.control-user.yaml`，保持 `live: false`。
+它是配置模板，不会改写现有服务的启动配置；服务器须另行填写自身数据目录与该用户 ID。
+升级整包后按本手册的单写者流程重启服务；仅替换页面无法启用后端收付规则。
+
+启用 live 前核对旧的已发行申购费：仍在账且尚未排队的费用会自动补建机构付款队列，
+已排队费用保持原收款人和业务键。历史本金、份额与未认领款不自动重新归属。
+确认本金不被划走，发行前本金和费用仍可退款；验收一笔机构入金、一笔普通申购费划转
+及控制用户私聊 `/check`。具体口径见[控制用户设计](../design/CONTROL_USER.md)。
+本机测试之外的真实收付与目标服务器部署仍待验收。
+
 ## 4. 凭据与密钥（永不进仓库）
 
 凭据**只**来自运行环境或数据目录里的凭据库，绝不写进 unit、任务、脚本、YAML 或迁移包。
@@ -152,7 +170,7 @@ python -m raricy_capital --config /etc/raricy-funds/funds.yaml --backup # 停机
 
 - **Linux**：`/etc/raricy-funds/funds.env`，`chown root:raricy-funds`，`chmod 0600`
   （脚本初始放置为 0640），由 unit 的 `EnvironmentFile=` 注入。样例见
-  [`packaging/funds/funds.env.example`](../packaging/funds/funds.env.example)。
+  [`packaging/funds/funds.env.example`](../../packaging/funds/funds.env.example)。
 - **Windows**：当前用户环境变量或独立凭据文件，切勿放进计划任务命令行。
 - 日志与事件详情会**按键名整体剔除**敏感字段（`password`、`token`、`cookie`、
   `auth`、`credential`、`session`、`private`、`api_key` 等）。
@@ -181,7 +199,7 @@ python -m raricy_capital --config /etc/raricy-funds/funds.yaml --backup # 停机
 
 ## 6. systemd 运行与单写者
 
-单元文件：[`packaging/funds/raricy-funds.service`](../packaging/funds/raricy-funds.service)。
+单元文件：[`packaging/funds/raricy-funds.service`](../../packaging/funds/raricy-funds.service)。
 要点：`User=raricy-funds`、`EnvironmentFile=-/etc/raricy-funds/funds.env`、
 `Environment=FUNDS_BOOTSTRAP_LOG_DIR=/var/lib/raricy-funds/logs`、
 `ExecStart=.../python -m raricy_capital --config /etc/raricy-funds/funds.yaml`、
@@ -224,7 +242,7 @@ ssh -N -L 127.0.0.1:8137:127.0.0.1:8137 \
     -i ~/.ssh/raricy_funds_tunnel funds-operator@your-server-host
 ```
 
-长期运行可用 [`packaging/funds/raricy-funds-tunnel.service`](../packaging/funds/raricy-funds-tunnel.service)：
+长期运行可用 [`packaging/funds/raricy-funds-tunnel.service`](../../packaging/funds/raricy-funds-tunnel.service)：
 它是 **systemd user 单元**，装在**运维/管理员本机**（不是服务器），以当前登录用户身份运行。
 因此它**不写 `User=`，也不使用 `%i`**——`%i` 只对模板单元 `foo@.service` 有定义，本文件名
 不是模板；`SSH_KEY` 用 `%h/.ssh/raricy_funds_tunnel`（当前用户家目录）而不是 `/home/%i/...`。
@@ -344,8 +362,8 @@ python tools/run_capital_service.py --data-dir data/capital_funds backup --label
 python -m raricy_capital --config /etc/raricy-funds/funds.yaml --backup
 ```
 
-[`raricy-funds-backup.service`](../packaging/funds/raricy-funds-backup.service) /
-[`raricy-funds-backup.timer`](../packaging/funds/raricy-funds-backup.timer) 是**默认禁用、
+[`raricy-funds-backup.service`](../../packaging/funds/raricy-funds-backup.service) /
+[`raricy-funds-backup.timer`](../../packaging/funds/raricy-funds-backup.timer) 是**默认禁用、
 且不由安装脚本安装**的停机备份入口（timer 不设 `OnCalendar`，永不自动触发）。**不要**
 自建外部每日定时器：那会开第二个写者，与运行中的服务争用同一份 SQLite。
 
@@ -432,7 +450,7 @@ powershell -File packaging\funds\windows\uninstall_funds_tasks.ps1
 ```
 
 - 注册的动作是 `wscript.exe` 调用
-  [`windows/run_funds_hidden.vbs`](../packaging/funds/windows/run_funds_hidden.vbs)：优先用
+  [`windows/run_funds_hidden.vbs`](../../packaging/funds/windows/run_funds_hidden.vbs)：优先用
   `<仓库根>\.venv\Scripts\pythonw.exe`，退回 `python.exe`，以隐藏窗口运行
   `python -m raricy_capital --config <配置>`；启动器等待子进程并回传退出码，任务据此
   在故障时按 1 分钟间隔自动重启（`RestartCount=999`）。
@@ -523,3 +541,23 @@ sudo systemctl disable --now raricy-funds.service         # 取消启用
 - [ ] 旧机停服 → 导出并校验迁移包 → 新机恢复 → 先 `live: false` 核对净值与份额 →
       再决定是否打开 `live`；
 - [ ] 凭据经独立安全通道成对转移（或在新机重新登录），全程未进迁移包与 Git。
+
+
+## 人工核对功能升级（2026-10-04）
+
+本版本新增逐笔详情、只读预览、按版本提交、严格关联已有申购单与原路退款队列。
+操作见 [人工核对手册](UNCLAIMED_REVIEW.md)，约束见 [人工核对设计](../design/UNCLAIMED_REVIEW.md)。
+
+这是包含后端的更新，旧版三文件静态更新包不足以发布本功能。按本文既有升级流程部署完整代码或
+wheel：确认实际服务入口与 Python 环境，停止服务后备份账簿及配置，安装新版本，再启动服务。
+不要覆盖账号凭据、管理令牌、配置和数据目录；仅保留一份账簿写入服务。
+
+上线后先检查只读列表、到账字段、候选和预览。正式处理需要 live 总闸开启；确认结果与实际站点
+收付流水后再登记验收。排队、余额不足与付款结果未知分别显示，不以队列创建代替付款成功。
+
+本机相关回归 202 项通过；验证使用独立测试数据库与虚构站点客户端。Linux 真实部署和真实账户
+端到端验收尚未完成。文档分类调整不改变配置、数据目录、基金规则与策略参数。
+
+隔离浏览器演示已验证：登录框隐藏、关联后净资产与份额不变、退款进度自动刷新为已退款、
+修改理由使预览失效、只读模式禁止提交、退出后清空页面、390px 布局无横向溢出。
+演示没有访问真实站点，也没有向真实用户转账或发送消息。

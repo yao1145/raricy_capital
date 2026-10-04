@@ -49,12 +49,12 @@ class FundStore:
         encoded=json.dumps(value,ensure_ascii=False,allow_nan=False,separators=(',',':'))
         with self.lock:return self.db.execute('INSERT OR IGNORE INTO records VALUES(?,?,?,?)',(namespace,key,encoded,now_ms())).rowcount==1
 
-    def list_items(self,namespace:str,prefix:str='',limit:int=10000):
+    def list_items(self,namespace:str,prefix:str='',limit:int|None=10000):
         with self.lock:
             rows=self.db.execute('SELECT key,value FROM records WHERE namespace=? ORDER BY key',(namespace,)).fetchall()
         return [(r[0],json.loads(r[1])) for r in rows if r[0].startswith(prefix)][:limit]
 
-    def list(self,namespace:str,prefix:str='',limit:int=10000):
+    def list(self,namespace:str,prefix:str='',limit:int|None=10000):
         return [v for _,v in self.list_items(namespace,prefix,limit)]
 
     def append_event(self,event:str,*,fund_id:str|None=None,level:str='info',details:dict|None=None,event_key:str|None=None,created_ms:int|None=None):

@@ -35,6 +35,8 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta
 from decimal import Decimal, ROUND_FLOOR, localcontext
+import hashlib
+import re
 import uuid
 
 from .contracts import (
@@ -47,7 +49,7 @@ from .contracts import (
     FundPolicy,
 )
 
-__all__ = ['FundLedger']
+__all__ = ['FundLedger', 'unclaimed_refund_key', 'unclaimed_refund_note']
 
 # Namespaces of the shared store.
 _FUNDS = 'funds'
@@ -65,6 +67,99 @@ _MSG = 'msg_keys'
 _SEEDS = 'seeds'
 
 _SUB_TTL_MS = 180 * 1000  # 180 second QR/payment-link validity
+
+#: Payout kind owned by the manual unclaimed-receipt review.  Only the guarded
+#: manual-refund dispatch in ``payments`` may drive these rows.
+UNCLAIMED_REFUND_KIND = 'unclaimed_refund'
+
+_ACTOR_RE = re.compile(r'[A-Za-z0-9_.:+-]{1,128}')
+_MAX_REASON = 500
+_MISSING = object()
+
+
+def unclaimed_refund_key(fund_id: str, transfer_id: str) -> str:
+    """Deterministic, site-safe business key for one incoming transfer's refund.
+
+    Derived only from the fund and the *incoming* transfer id, so the same
+    receipt can never produce a second key -- a retry re-sends this identical
+    key and the upstream idempotency guarantees one payout.  Kept within the
+    site's 48-character ``[A-Za-z0-9_.:-]`` limit.
+    """
+    digest = hashlib.sha1(f'{fund_id}|{transfer_id}'.encode('utf-8')).hexdigest()[:20]
+    return f'uf-{digest}'
+
+
+def unclaimed_refund_note(fund_id: str, transfer_id: str) -> str:
+    """Deterministic, unique outgoing note used to verify the refund was paid.
+
+    The refund reconciliation can only trust an outgoing ledger row whose
+    recipient, amount *and* note all match, so the note must be stable across
+    retries and unique per receipt within the site's 30-character limit.
+    """
+    digest = hashlib.sha1(f'{fund_id}|{transfer_id}'.encode('utf-8')).hexdigest()[:16]
+    return f'退款 {digest}'
+
+
+def _unclaimed_refund_payout_id(fund_id: str, transfer_id: str) -> str:
+    return unclaimed_refund_key(fund_id, transfer_id)
+
+
+def _as_text(value: object) -> str:
+    if value is None or isinstance(value, (bytes, bytearray)):
+        return ''
+    return str(value).strip()
+
+
+def _coerce_int(value: object) -> int | None:
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _field(source: object, name: str, default=None):
+    """Read ``name`` from a mapping or from a client DTO attribute."""
+    if source is None:
+        return default
+    if isinstance(source, dict):
+        return source.get(name, default)
+    return getattr(source, name, default)
+
+
+def _dedupe(codes: list[str]) -> list[str]:
+    out: list[str] = []
+    for code in codes:
+        if code not in out:
+            out.append(code)
+    return out
+
+
+def _bounded_reason(value: object) -> str:
+    text = _as_text(value)
+    if not text:
+        raise FundError('reason_required')
+    if len(text) > _MAX_REASON:
+        raise FundError('reason_too_long')
+    return text
+
+
+def _bounded_actor(value: object) -> str:
+    """Opaque, bounded operator handle -- never a raw session or token.
+
+    The web layer derives it as a hash of the authenticated session/credential;
+    a cookie fragment (``;``/``=``), whitespace or an over-long value is refused
+    outright instead of being copied into the audit trail.
+    """
+    text = _as_text(value)
+    if not text:
+        raise FundError('actor_required')
+    if len(text) > 128:
+        raise FundError('actor_too_long')
+    if _ACTOR_RE.fullmatch(text) is None:
+        raise FundError('invalid_actor')
+    return text
 
 
 def _as_units(value: object, *, positive: bool = False) -> int:
@@ -221,9 +316,119 @@ class FundLedger:
     #: before a cutoff while rejecting multi-hour stale quotes outright.
     max_quote_age_ms = 15 * 1000
 
-    def __init__(self, store, policies: dict[str, FundPolicy] | None = None):
+    def __init__(self, store, policies: dict[str, FundPolicy] | None = None, *, control_user_id: str = ""):
+        from .contracts import validate_control_user_id
+        self.control_user_id = validate_control_user_id(control_user_id)
         self.store = store
         self.policies = policies or POLICIES
+
+    def is_control_user(self, user_id: str) -> bool:
+        return bool(self.control_user_id) and user_id == self.control_user_id
+
+    def _receive_control_capital(self, fund: dict, match: dict | None, receipt: dict, now: int) -> dict:
+        """Recognise a verified controller receipt as fee-free pending capital.
+
+        This is still priced by the existing monthly issuance process. A direct
+        transfer needs no order/note/QR deadline; source identity dedupes it.
+        """
+        fund_id = fund['fund_id']
+        occurred, amount = receipt['occurred_ms'], receipt['amount_units']
+        period = _ordinary_period(occurred)[0]
+        if match is None:
+            digest = hashlib.sha256(f"{fund_id}:{receipt['transfer_id']}".encode()).hexdigest()[:20]
+            match = {'id': f'{fund_id}:capital-{digest}', 'fund_id': fund_id,
+                     'user_id': self.control_user_id, 'created_ms': occurred,
+                     'payment_note': f'{fund_id}-capital-{digest[:8]}',
+                     'message_key': f"capital:{receipt['transfer_id']}"}
+        match.update(principal_units=amount, fee_units=0, total_units=amount,
+                     status='received', capital_origin='control', period=period,
+                     expires_ms=occurred, deadline_ms=_period_window_ms(period),
+                     occurred_ms=occurred, received_ms=now,
+                     original_note=receipt['note'], source_transfer_id=receipt['transfer_id'],
+                     transaction_row_id=receipt.get('transaction_row_id'))
+        self.store.put(_SUBS, match['id'], match)
+        fund['pending_receipts_units'] += amount
+        self._save_fund(fund)
+        receipt.update(status='received', kind='institution_capital', subscription_id=match['id'])
+        self.store.put(_TRANSFERS, receipt['transfer_id'], receipt)
+        self.store.append_event('control_capital_received', fund_id=fund_id, created_ms=now,
+            details={'transfer_id': receipt['transfer_id'], 'subscription_id': match['id'],
+                     'amount_units': amount, 'period': period})
+        self._notify(fund_id, self.control_user_id,
+            f'机构本金到账 {money_text(amount)} 小鱼干，免手续费；按 {period} 月末净值确认份额', now,
+            notice_id=f"control-capital:{fund_id}:{receipt['transfer_id']}")
+        return receipt
+
+    def _queue_subscription_fee(self, fund: dict, sub: dict, now: int) -> dict | None:
+        """Reclassify an issued customer fee into one pinned transfer liability."""
+        fee = int(sub.get('fee_units') or 0)
+        if (not self.control_user_id or sub.get('status') != 'issued' or fee <= 0
+                or sub.get('capital_origin') == 'control' or self.is_control_user(sub['user_id'])):
+            return None
+        digest = hashlib.sha256(f"{fund['fund_id']}:{sub['id']}".encode()).hexdigest()[:20]
+        payout_id = f'fee-{digest}'
+        key = f"{fund['fund_id']}:{payout_id}"
+        if self.store.get(_PAYOUTS, key) is not None:
+            return None
+        if fund['fee_balance_units'] < fee:
+            raise FundError('fee_ledger_inconsistent')
+        source = self.store.get(_TRANSFERS, sub.get('source_transfer_id', '')) or {}
+        payout = {'id': payout_id, 'fund_id': fund['fund_id'],
+                  'user_id': self.control_user_id, 'amount_units': fee,
+                  'kind': 'subscription_fee', 'status': 'pending', 'created_ms': now,
+                  'note': f'申购费 {digest[:16]}', 'idempotency_key': payout_id,
+                  'subscription_id': sub['id'], 'source_transfer_id': sub.get('source_transfer_id'),
+                  'transaction_row_id': sub.get('transaction_row_id') or source.get('transaction_row_id')}
+        self.store.put(_PAYOUTS, key, payout)
+        fund['fee_balance_units'] -= fee
+        fund['liabilities_units'] += fee
+        sub['fee_payout_id'] = payout_id
+        self.store.append_event('institution_fee_queued', fund_id=fund['fund_id'], created_ms=now,
+            details={'payout_id': payout_id, 'subscription_id': sub['id'],
+                     'amount_units': fee, 'recipient_id': self.control_user_id})
+        return payout
+
+    def queue_institution_fees(self, now_ms) -> list[dict]:
+        """Queue unremitted issued fees, including older orders; caller owns live."""
+        if not self.control_user_id:
+            return []
+        now = _as_ms(now_ms)
+        queued = []
+        with self.store.transaction():
+            for fund_id in self.policies:
+                self._ensure_cutoff_snapshot(fund_id, now)
+                self._ensure_emergency_snapshot(fund_id, now)
+                fund = self._fund(fund_id)
+                changed = False
+                for key, sub in self.store.list_items(_SUBS, f'{fund_id}:', limit=None):
+                    payout = self._queue_subscription_fee(fund, sub, now)
+                    if payout is not None:
+                        self.store.put(_SUBS, key, sub)
+                        queued.append(payout)
+                        changed = True
+                if changed:
+                    self._save_fund(fund)
+        return queued
+
+    def control_finances(self, user_id: str) -> list[dict]:
+        """All financial categories for the configured controller; pure read."""
+        if not self.is_control_user(user_id):
+            raise FundError('control_user_required')
+        out = []
+        for fund_id in self.policies:
+            state = self.status(fund_id, user_id=user_id)
+            subs = self.store.list(_SUBS, f'{fund_id}:', limit=None)
+            seeds = self.store.list(_SEEDS, f'{fund_id}:', limit=None)
+            fees = [p for p in self.store.list(_PAYOUTS, f'{fund_id}:', limit=None)
+                    if p.get('kind') == 'subscription_fee']
+            state['control_capital_units'] = sum(int(s.get('principal_units', 0)) for s in subs
+                if s.get('capital_origin') == 'control' and s.get('status') in ('received', 'issued')) + sum(
+                int(s.get('principal_units', 0)) for s in seeds if s.get('user_id') == user_id)
+            state['institution_fee_paid_units'] = sum(int(p['amount_units']) for p in fees if p['status'] == 'paid')
+            state['institution_fee_pending_units'] = sum(int(p['amount_units']) for p in fees if p['status'] not in ('paid', 'cancelled'))
+            state['institution_fee_unknown_units'] = sum(int(p['amount_units']) for p in fees if p['status'] in ('sending', 'uncertain'))
+            out.append(state)
+        return out
 
     # ------------------------------------------------------------------ helpers
     def _policy(self, fund_id: str) -> FundPolicy:
@@ -622,7 +827,8 @@ class FundLedger:
         if not message_key:
             raise FundError('invalid_key')
         now = _as_ms(now_ms)
-        fee = int(Decimal(principal) * Decimal(str(policy.subscription_fee)))
+        fee = (0 if self.is_control_user(user_id) else
+               int(Decimal(principal) * Decimal(str(policy.subscription_fee))))
         total = principal + fee
         with self.store.transaction():
             self._ensure_cutoff_snapshot(fund_id, now)
@@ -690,6 +896,7 @@ class FundLedger:
             raise FundError('invalid_transfer') from None
         if not transfer_id:
             raise FundError('invalid_transfer')
+        row_id = _coerce_int(tx.get('transaction_row_id'))
 
         with self.store.transaction():
             self._ensure_cutoff_snapshot(fund_id, now)
@@ -717,10 +924,17 @@ class FundLedger:
                 'amount_units': amount,
                 'note': note,
                 'occurred_ms': occurred,
+                'transaction_row_id': row_id,
                 'subscription_id': None,
+                'unclaimed_id': None,
                 'status': 'unclaimed',
                 'refund_payout_id': None,
             }
+
+            if self.is_control_user(from_user_id):
+                if amount <= 0 or occurred <= 0 or occurred > now + 1000:
+                    raise FundError('invalid_transfer')
+                return self._receive_control_capital(fund, match, result, now)
 
             if match is None:
                 # Wrong amount / note / unknown payer: hold as an unclaimed liability.
@@ -734,9 +948,16 @@ class FundLedger:
                     'amount_units': amount,
                     'note': note,
                     'occurred_ms': occurred,
+                    # The upstream identity of the receipt is kept on the row so a
+                    # manual refund can be keyed durably and re-verified later.
+                    'transfer_id': transfer_id,
+                    'transaction_row_id': row_id,
                     'status': 'unclaimed',
+                    'version': 0,
+                    'history': [],
                     'created_ms': now,
                 })
+                result['unclaimed_id'] = unclaimed_id
                 self._notify(fund_id, from_user_id,
                              f'到账 {money_text(amount)} 小鱼干 未能匹配有效订单，已记为未认领款待人工核对', now)
                 result['status'] = 'unclaimed'
@@ -767,6 +988,8 @@ class FundLedger:
                 issue_period = max(application_period, arrival_period)
                 rolled = issue_period != application_period
                 match['status'] = 'received'
+                match['source_transfer_id'] = transfer_id
+                match['transaction_row_id'] = row_id
                 match['occurred_ms'] = occurred
                 match['received_ms'] = now
                 match['period'] = issue_period
@@ -797,6 +1020,523 @@ class FundLedger:
 
             self.store.put(_TRANSFERS, transfer_id, result)
             return result
+
+    # ------------------------------------------------- manual unclaimed review
+    def unclaimed(self, fund_id: str | None = None, status: str | None = None) -> list[dict]:
+        """Unclaimed receipts, filtered by fund and by *displayed* status.
+
+        ``status`` matches ``resolution_status`` (``unclaimed`` / ``linked`` /
+        ``refund_queued`` / ``refund_unknown`` / ``refunded``) rather than the
+        stored row status, so "still to review" and "queued" never collapse into
+        the same filter.
+        """
+        out = []
+        for key, record in self.store.list_items(_UNCLAIMED, limit=None):
+            if fund_id and record.get('fund_id') != fund_id:
+                continue
+            view = self._unclaimed_view(key, record)
+            if status and view['resolution_status'] != status:
+                continue
+            out.append(view)
+        out.sort(key=lambda r: (int(r.get('created_ms') or 0), str(r.get('id'))))
+        return out
+
+    def unclaimed_detail(self, fund_id: str, unclaimed_id: str, now_ms=None) -> dict:
+        """One receipt with its original fields, link candidates and audit history."""
+        record = self._require_unclaimed(fund_id, unclaimed_id)
+        at = _as_ms(now_ms) if now_ms is not None else int(record.get('created_ms') or 0)
+        view = self._unclaimed_view(record['id'], record)
+        view['receipt'] = {
+            'unclaimed_id': record['id'],
+            'fund_id': record['fund_id'],
+            'transfer_id': view.get('transfer_id'),
+            'transaction_row_id': view.get('transaction_row_id'),
+            'from_user_id': record['from_user_id'],
+            'amount_units': int(record['amount_units']),
+            'note': record.get('note') or '',
+            'occurred_ms': int(record['occurred_ms']),
+            'received_ms': record.get('created_ms'),
+            'status': record.get('status') or 'unclaimed',
+        }
+        view['candidates'] = self._link_candidates(fund_id, record, at)
+        view['concurrency'] = 'optimistic_version_cas'
+        return view
+
+    def preview_unclaimed(self, fund_id: str, unclaimed_id: str, action: str, *,
+                          subscription_id: str | None = None, verified_transfer=None,
+                          now_ms=None) -> dict:
+        """Read-only eligibility check for one action.
+
+        It never snapshots a period, backfills a link, or writes anything: the
+        operator gets the same verdict the commit would reach, and only a
+        successful :meth:`resolve_unclaimed` moves money.  ``verified_transfer``
+        is the freshly re-read upstream receipt (never caller-supplied amounts).
+        """
+        record = self._require_unclaimed(fund_id, unclaimed_id)
+        at = _as_ms(now_ms) if now_ms is not None else int(record.get('created_ms') or 0)
+        errors, info = self._evaluate(fund_id, record, action, subscription_id,
+                                      verified_transfer, at)
+        subscription = info.get('subscription')
+        return {
+            'eligible': not errors,
+            'errors': errors,
+            'action': action,
+            'record': self._unclaimed_view(record['id'], record),
+            'subscription': dict(subscription) if subscription else None,
+            'backfill_transfer_id': info.get('expected_transfer_id'),
+            'checked_ms': at,
+        }
+
+    def resolve_unclaimed(self, fund_id: str, unclaimed_id: str, action: str, *,
+                          version, reason, actor, verified_transfer, now_ms,
+                          subscription_id: str | None = None) -> dict:
+        """Commit one review decision under an atomic version CAS.
+
+        Pure domain: there is no ``live`` switch here, so the caller (service /
+        web) owns the live gate, and nothing is written unless the whole
+        decision is valid.  ``reason``/``actor`` are bounded and opaque, the
+        receipt is re-verified against the authoritative row, and a stale
+        version or an already-resolved receipt is refused.
+        """
+        self._policy(fund_id)
+        if action not in ('link', 'refund'):
+            raise FundError('invalid_action')
+        reason_text = _bounded_reason(reason)
+        actor_text = _bounded_actor(actor)
+        if isinstance(version, bool) or not isinstance(version, int) or version < 0:
+            raise FundError('invalid_version')
+        now = _as_ms(now_ms)
+        with self.store.transaction():
+            record = self._require_unclaimed(fund_id, unclaimed_id)
+            if int(record.get('version', 0) or 0) != version:
+                raise FundError('stale_version')
+            if (record.get('status') or 'unclaimed') != 'unclaimed':
+                raise FundError('already_resolved')
+            errors, info = self._evaluate(fund_id, record, action, subscription_id,
+                                          verified_transfer, now)
+            if errors:
+                raise FundError(errors[0])
+            # The books must be frozen before this write changes them.
+            self._ensure_cutoff_snapshot(fund_id, now)
+            self._ensure_emergency_snapshot(fund_id, now)
+            if action == 'link':
+                return self._resolve_link(fund_id, record, info, reason_text, actor_text, now)
+            return self._resolve_refund(fund_id, record, info, reason_text, actor_text, now)
+
+    # ---- review internals -------------------------------------------------
+    def _require_unclaimed(self, fund_id: str, unclaimed_id: str) -> dict:
+        record = self.store.get(_UNCLAIMED, unclaimed_id) if unclaimed_id else None
+        if record is None or record.get('fund_id') != fund_id:
+            raise FundError('unclaimed_not_found')
+        if not record.get('id'):
+            record['id'] = unclaimed_id
+        return record
+
+    def _payout_for(self, record: dict) -> tuple[str | None, dict | None]:
+        payout_id = record.get('refund_payout_id')
+        if not payout_id:
+            return None, None
+        return payout_id, self.store.get(_PAYOUTS, f"{record['fund_id']}:{payout_id}")
+
+    def _unclaimed_view(self, key: str, record: dict) -> dict:
+        payout_id, payout = self._payout_for(record)
+        status = record.get('status') or 'unclaimed'
+        payout_status = payout.get('status') if payout else None
+        if status == 'refund_queued':
+            if payout_status == 'paid':
+                resolution = 'refunded'
+            elif payout_status in ('sending', 'uncertain'):
+                resolution = 'refund_unknown'
+            else:
+                resolution = 'refund_queued'
+        elif status == 'linked':
+            resolution = 'linked'
+        else:
+            resolution = 'unclaimed'
+        view = dict(record)
+        view['id'] = record.get('id') or key
+        view['version'] = int(record.get('version', 0) or 0)
+        view['status'] = status
+        view['resolution_status'] = resolution
+        view['refund_payout_id'] = payout_id
+        view['payout_status'] = payout_status
+        view['refund_transfer_id'] = (payout or {}).get('transfer_id')
+        view['refund_paid_ms'] = (payout or {}).get('paid_ms')
+        view['waiting_reason'] = (payout or {}).get('waiting_reason')
+        view['history'] = list(record.get('history') or [])
+        # Expose an unambiguous historical identity for a read-only upstream lookup.
+        # Persist the backlink only after verified resolution commits.
+        if status == 'unclaimed' and not view.get('transfer_id'):
+            candidates = self._backlink_candidates(record['fund_id'], record)
+            if len(candidates) == 1 and not self._duplicate_unclaimed(record):
+                view['transfer_id'] = candidates[0]['transfer_id']
+                view['transaction_row_id'] = candidates[0].get('transaction_row_id')
+                view['backlink_pending'] = True
+        return view
+
+    def _backlink_candidates(self, fund_id: str, record: dict) -> list[dict]:
+        """Historically transferred rows that can only be this one receipt.
+
+        Rows written before the transfer id was stored carry no ``unclaimed_id``;
+        they may be adopted only when fund, payer, amount and arrival time pick
+        out exactly one candidate.  Anything ambiguous stays isolated.
+        """
+        out = []
+        for _, row in self.store.list_items(_TRANSFERS, limit=None):
+            if row.get('fund_id') != fund_id or (row.get('status') or '') != 'unclaimed':
+                continue
+            owner = row.get('unclaimed_id')
+            if owner and owner != record['id']:
+                continue
+            if _as_text(row.get('from_user_id')) != _as_text(record.get('from_user_id')):
+                continue
+            if _coerce_int(row.get('amount_units')) != int(record['amount_units']):
+                continue
+            if _coerce_int(row.get('occurred_ms')) != int(record['occurred_ms']):
+                continue
+            if (row.get('note') or '') != (record.get('note') or ''):
+                continue
+            out.append(row)
+        return out
+
+    def _duplicate_unclaimed(self, record: dict) -> bool:
+        for _, other in self.store.list_items(_UNCLAIMED, limit=None):
+            if other.get('id') == record.get('id') or other.get('status', 'unclaimed') != 'unclaimed':
+                continue
+            if other.get('fund_id') != record.get('fund_id'):
+                continue
+            same_identity = bool(record.get('transfer_id')) and other.get('transfer_id') == record['transfer_id']
+            same_legacy_tuple = not other.get('transfer_id') and all(
+                other.get(field) == record.get(field)
+                for field in ('from_user_id', 'amount_units', 'occurred_ms', 'note'))
+            if same_identity or same_legacy_tuple:
+                return True
+        return False
+
+    @staticmethod
+    def _issue_period(sub: dict, occurred: int) -> str:
+        application = sub.get('period') or _period_from_ms(
+            int(sub.get('deadline_ms') or occurred) - 1)
+        return max(str(application), _ordinary_period(occurred)[0])
+
+    def _link_errors(self, sub: dict, record: dict, now_ms: int) -> list[str]:
+        """Why this order may not be linked to this receipt (empty = eligible)."""
+        errors: list[str] = []
+        if sub.get('fund_id') != record.get('fund_id'):
+            errors.append('subscription_fund_mismatch')
+        if _as_text(sub.get('user_id')) != _as_text(record.get('from_user_id')):
+            errors.append('payer_mismatch')
+        if _coerce_int(sub.get('total_units')) != int(record['amount_units']):
+            errors.append('amount_mismatch')
+        occurred = int(record['occurred_ms'])
+        if occurred < int(sub.get('created_ms') or 0):
+            errors.append('arrival_before_order')
+        expires = int(sub.get('expires_ms') or 0)
+        if occurred > expires:
+            errors.append('arrival_too_late')
+        if (sub.get('status') or '') not in ('pending', 'expired'):
+            errors.append('subscription_settled')
+        issue_period = self._issue_period(sub, occurred)
+        if self.store.get(_PERIODS, f"{record['fund_id']}:{issue_period}") is not None:
+            errors.append('frozen_period')
+        if int(now_ms) >= _period_cutoff_ms(issue_period):
+            errors.append('period_closed')
+        return _dedupe(errors)
+
+    def _link_candidates(self, fund_id: str, record: dict, now_ms: int) -> list[dict]:
+        out = []
+        for _, sub in self.store.list_items(_SUBS, f'{fund_id}:'):
+            if _as_text(sub.get('user_id')) != _as_text(record.get('from_user_id')):
+                continue
+            if _coerce_int(sub.get('total_units')) != int(record['amount_units']):
+                continue
+            errors = self._link_errors(sub, record, now_ms)
+            out.append({
+                'subscription_id': sub['id'],
+                'user_id': sub.get('user_id'),
+                'status': sub.get('status'),
+                'payment_note': sub.get('payment_note'),
+                'note_matches': (sub.get('payment_note') or '') == (record.get('note') or ''),
+                'principal_units': int(sub.get('principal_units') or 0),
+                'fee_units': int(sub.get('fee_units') or 0),
+                'total_units': int(sub.get('total_units') or 0),
+                'period': sub.get('period'),
+                'created_ms': int(sub.get('created_ms') or 0),
+                'expires_ms': int(sub.get('expires_ms') or 0),
+                'eligible': not errors,
+                'errors': errors,
+            })
+        out.sort(key=lambda c: (c['created_ms'], c['subscription_id']))
+        return out[:20]
+
+    @staticmethod
+    def _verified_fields(verified) -> dict | None:
+        """Normalise the re-read authoritative receipt; ``None`` if unusable."""
+        if verified is None:
+            return None
+        transfer_id = _as_text(_field(verified, 'transfer_id'))
+        if not transfer_id:
+            return None
+        return {
+            'transfer_id': transfer_id,
+            'from_user_id': _as_text(_field(verified, 'from_user_id')),
+            'amount_units': _field(verified, 'amount_units'),
+            'occurred_ms': _field(verified, 'occurred_ms'),
+            'note': _field(verified, 'note', _MISSING),
+            'transaction_row_id': _field(verified, 'transaction_row_id'),
+        }
+
+    @staticmethod
+    def _verification_errors(record: dict, verified: dict | None, expected: str) -> list[str]:
+        if verified is None:
+            return ['verification_required']
+        amount = verified['amount_units']
+        occurred = verified['occurred_ms']
+        if type(amount) is not int or amount <= 0 or type(occurred) is not int or occurred <= 0:
+            return ['verification_mismatch']
+        note = verified['note']
+        mismatched = (
+            verified['from_user_id'] != _as_text(record.get('from_user_id'))
+            or amount is None or amount != int(record['amount_units'])
+            or occurred is None or occurred != int(record['occurred_ms'])
+            or (bool(expected) and verified['transfer_id'] != expected)
+            or not isinstance(note, str) or note != (record.get('note') or '')
+        )
+        return ['verification_mismatch'] if mismatched else []
+
+    def _evaluate(self, fund_id: str, record: dict, action: str, subscription_id,
+                  verified_transfer, now_ms: int) -> tuple[list[str], dict]:
+        errors: list[str] = []
+        info: dict = {'subscription': None, 'backlink': None, 'expected_transfer_id': None}
+        if action not in ('link', 'refund'):
+            return ['invalid_action'], info
+        if (record.get('status') or 'unclaimed') != 'unclaimed':
+            return ['already_resolved'], info
+        expected = _as_text(record.get('transfer_id'))
+        if not expected:
+            candidates = self._backlink_candidates(fund_id, record)
+            if len(candidates) > 1:
+                info['ambiguous'] = True
+            if len(candidates) == 1:
+                expected = _as_text(candidates[0].get('transfer_id'))
+                info['backlink'] = candidates[0]
+        info['expected_transfer_id'] = expected or None
+        if not expected:
+            errors.append('missing_backlink')
+            if info.get('ambiguous'):
+                errors.append('ambiguous_backlink')
+        else:
+            canonical = self.store.get(_TRANSFERS, expected)
+            if (canonical is None or canonical.get('fund_id') != fund_id
+                    or canonical.get('status') != 'unclaimed'
+                    or canonical.get('unclaimed_id') not in (None, record['id'])
+                    or any(canonical.get(field) != record.get(field)
+                           for field in ('from_user_id', 'amount_units', 'occurred_ms', 'note'))):
+                errors.append('receipt_conflict')
+        if self._duplicate_unclaimed(record):
+            errors.append('ambiguous_backlink')
+        verified = self._verified_fields(verified_transfer)
+        info['verified'] = verified or {}
+        errors.extend(self._verification_errors(record, verified, expected))
+        if action == 'link':
+            if not subscription_id:
+                errors.append('subscription_required')
+            else:
+                sub = self.store.get(_SUBS, subscription_id)
+                if sub is None:
+                    errors.append('subscription_not_found')
+                elif sub.get('fund_id') != fund_id:
+                    errors.append('subscription_fund_mismatch')
+                else:
+                    info['subscription'] = sub
+                    errors.extend(self._link_errors(sub, record, now_ms))
+        elif not expected:
+            errors.append('missing_backlink')
+        return _dedupe(errors), info
+
+    @staticmethod
+    def _ledger_snapshot(fund: dict) -> dict:
+        return {
+            'wallet_units': fund['wallet_units'],
+            'pending_receipts_units': fund['pending_receipts_units'],
+            'fee_balance_units': fund['fee_balance_units'],
+            'unclaimed_units': fund['unclaimed_units'],
+            'liabilities_units': fund['liabilities_units'],
+            'shares_atoms': fund['shares_atoms'],
+            'capital_flows_units': fund.get('capital_flows_units', 0),
+            'equity_units': FundLedger._equity(fund),
+        }
+
+    def _resolve_link(self, fund_id: str, record: dict, info: dict, reason: str,
+                      actor: str, now: int) -> dict:
+        """Turn a verified wrong-note receipt into a received order (NAV neutral).
+
+        The money already sits in the wallet as an unclaimed liability; this only
+        re-labels it as pending principal plus prepaid fee, so equity, shares and
+        capital flows do not move.  Shares are issued later, by the existing
+        month-end settlement, under the order's own (possibly rolled) period.
+        """
+        sub = self.store.get(_SUBS, info['subscription']['id'])
+        fund = self._fund(fund_id)
+        occurred = int(record['occurred_ms'])
+        application_period = str(sub.get('period') or _period_from_ms(
+            int(sub.get('deadline_ms') or occurred) - 1))
+        issue_period = max(application_period, _ordinary_period(occurred)[0])
+        principal = int(sub['principal_units'])
+        fee = int(sub['fee_units'])
+        total = principal + fee
+        if fund['unclaimed_units'] < total:
+            raise FundError('ledger_inconsistent')
+        before = self._ledger_snapshot(fund)
+
+        fund['unclaimed_units'] -= total
+        fund['pending_receipts_units'] += principal
+        fund['fee_balance_units'] += fee
+        sub['source_transfer_id'] = info['expected_transfer_id']
+        sub['transaction_row_id'] = (record.get('transaction_row_id')
+            or info.get('verified', {}).get('transaction_row_id'))
+        sub['status'] = 'received'
+        sub['occurred_ms'] = occurred
+        sub['received_ms'] = now
+        sub['period'] = issue_period
+        sub['deadline_ms'] = _period_window_ms(issue_period)
+        # The original note is preserved untouched; the correction lives only in
+        # the audit record.
+        sub['manual_review'] = {
+            'unclaimed_id': record['id'],
+            'reason': reason,
+            'actor': actor,
+            'at_ms': now,
+            'original_note': record.get('note') or '',
+        }
+        if issue_period != application_period:
+            sub['rollover_notice_period'] = issue_period
+        self.store.put(_SUBS, sub['id'], sub)
+        self._save_fund(fund)
+        self._notify(
+            fund_id, sub['user_id'],
+            f'到账 {money_text(total)} 小鱼干已人工核对并关联订单 {sub["payment_note"]}，'
+            f'份额将于 {issue_period} 月末估值后确认', now,
+            notice_id=f'unclaimed-link:{fund_id}:{record["id"]}')
+        return self._commit_resolution(fund_id, record, 'linked', action='link', reason=reason,
+                                       actor=actor, now=now, before=before, info=info,
+                                       subscription_id=sub['id'])
+
+    def _resolve_refund(self, fund_id: str, record: dict, info: dict, reason: str,
+                        actor: str, now: int) -> dict:
+        """Queue one durable, full, original-payer refund (NAV neutral).
+
+        The unclaimed liability becomes a payout liability for exactly the
+        original amount.  The payout id, business key and note are all derived
+        from the fund and the *incoming* transfer id, so a retry can only ever
+        re-send the same intent -- never a second refund.
+        """
+        transfer_id = info.get('expected_transfer_id')
+        if not transfer_id:
+            raise FundError('missing_backlink')
+        amount = int(record['amount_units'])
+        payout_id = _unclaimed_refund_payout_id(fund_id, transfer_id)
+        if self.store.get(_PAYOUTS, f'{fund_id}:{payout_id}') is not None:
+            raise FundError('payout_exists')
+        fund = self._fund(fund_id)
+        if fund['unclaimed_units'] < amount:
+            raise FundError('ledger_inconsistent')
+        before = self._ledger_snapshot(fund)
+        self.store.put(_PAYOUTS, f'{fund_id}:{payout_id}', {
+            'id': payout_id,
+            'fund_id': fund_id,
+            'user_id': record['from_user_id'],
+            'amount_units': amount,
+            'note': unclaimed_refund_note(fund_id, transfer_id),
+            'idempotency_key': unclaimed_refund_key(fund_id, transfer_id),
+            'status': 'pending',
+            'kind': UNCLAIMED_REFUND_KIND,
+            'created_ms': now,
+            'unclaimed_id': record['id'],
+            'source_transfer_id': transfer_id,
+            'transaction_row_id': (record.get('transaction_row_id')
+                or info.get('verified', {}).get('transaction_row_id')
+                or (info.get('backlink') or {}).get('transaction_row_id')),
+        })
+        fund['unclaimed_units'] -= amount
+        fund['liabilities_units'] += amount
+        self._save_fund(fund)
+        self._notify(
+            fund_id, record['from_user_id'],
+            f'未认领款 {money_text(amount)} 小鱼干已核实，将原路全额退回，'
+            '进度可在未认领款页面查看', now,
+            notice_id=f'unclaimed-refund:{fund_id}:{record["id"]}')
+        return self._commit_resolution(fund_id, record, 'refund_queued', action='refund',
+                                       reason=reason, actor=actor, now=now, before=before,
+                                       info=info, payout_id=payout_id)
+
+    def _commit_resolution(self, fund_id: str, record: dict, status: str, *, action: str,
+                           reason: str, actor: str, now: int, before: dict,
+                           info: dict | None = None, subscription_id: str | None = None,
+                           payout_id: str | None = None) -> dict:
+        """Persist the version bump, the audit entry and the receipt's new state."""
+        info = info or {}
+        fund = self._fund(fund_id)
+        after = self._ledger_snapshot(fund)
+        transfer_id = _as_text(record.get('transfer_id')) or info.get('expected_transfer_id')
+        backlink = info.get('backlink') or {}
+        record = dict(record)
+        record['version'] = int(record.get('version', 0) or 0) + 1
+        record['status'] = status
+        record['resolved_ms'] = now
+        record['resolved_action'] = action
+        record['actor'] = actor
+        record['reason'] = reason
+        if transfer_id:
+            # Committing the resolution is what makes the historical backfill real.
+            record['transfer_id'] = transfer_id
+        if record.get('transaction_row_id') is None and backlink.get('transaction_row_id') is not None:
+            record['transaction_row_id'] = backlink['transaction_row_id']
+        if subscription_id:
+            record['subscription_id'] = subscription_id
+        if payout_id:
+            record['refund_payout_id'] = payout_id
+        entry = {
+            'action': action,
+            'actor': actor,
+            'reason': reason,
+            'at_ms': now,
+            'version': record['version'],
+            'before': before,
+            'after': after,
+            'transfer_id': transfer_id or None,
+            'subscription_id': subscription_id,
+            'payout_id': payout_id,
+        }
+        record['history'] = list(record.get('history') or []) + [entry]
+        self.store.put(_UNCLAIMED, record['id'], record)
+
+        transfer = self.store.get(_TRANSFERS, transfer_id) if transfer_id else None
+        if transfer is not None:
+            # A replayed receipt finds this row and can never re-match or re-credit.
+            transfer = dict(transfer)
+            transfer['status'] = status
+            transfer['unclaimed_id'] = record['id']
+            transfer['resolved_ms'] = now
+            if subscription_id:
+                transfer['subscription_id'] = subscription_id
+            if payout_id:
+                transfer['refund_payout_id'] = payout_id
+            self.store.put(_TRANSFERS, transfer_id, transfer)
+
+        self.store.append_event('unclaimed_resolved', fund_id=fund_id, details={
+            'unclaimed_id': record['id'],
+            'action': action,
+            'actor': actor,
+            'reason': reason,
+            'transfer_id': transfer_id or None,
+            'subscription_id': subscription_id,
+            'payout_id': payout_id,
+            'version': record['version'],
+            'before': before,
+            'after': after,
+        }, created_ms=now)
+        return self._unclaimed_view(record['id'], record)
 
     # ---------------------------------------------------------------- redemption
     def request_redemption(self, fund_id: str, user_id: str, amount_units, kind: str,
@@ -1151,6 +1891,7 @@ class FundLedger:
                     issued_external += shares
                     sub['status'] = 'issued'
                     sub['issued_shares_atoms'] = shares
+                    self._queue_subscription_fee(fund, sub, now)
                     self.store.put(_SUBS, sub_key, sub)
                     issued_subs.append({'subscription_id': sub['id'], 'user_id': sub['user_id'],
                                         'shares_atoms': shares,
@@ -1376,6 +2117,7 @@ class FundLedger:
             issued_external += shares
             sub['status'] = 'issued'
             sub['issued_shares_atoms'] = shares
+            self._queue_subscription_fee(fund, sub, now)
             self.store.put(_SUBS, sub_key, sub)
             issued_subs.append({'subscription_id': sub['id'], 'user_id': sub['user_id'],
                                 'shares_atoms': shares,
@@ -1603,7 +2345,7 @@ class FundLedger:
                 out.append(value)
         return sorted(out, key=lambda r: r['created_ms'])
 
-    def mark_payout_paid(self, payout_id: str, transfer_id: str, now_ms) -> dict:
+    def mark_payout_paid(self, payout_id: str, transfer_id: str, now_ms, *, wallet_units: int | None = None) -> dict:
         now = _as_ms(now_ms)
         with self.store.transaction():
             found_key = None
@@ -1625,9 +2367,87 @@ class FundLedger:
             record['paid_ms'] = now
             record['transfer_id'] = transfer_id
             fund['liabilities_units'] = max(0, fund['liabilities_units'] - record['amount_units'])
-            fund['wallet_units'] = max(0, fund['wallet_units'] - record['amount_units'])
+            if wallet_units is not None:
+                if record.get('kind') not in (UNCLAIMED_REFUND_KIND, 'subscription_fee') or isinstance(wallet_units, bool) or not isinstance(wallet_units, int) or wallet_units < 0:
+                    raise FundError('invalid_balance')
+                fund['wallet_units'] = wallet_units
+            else:
+                fund['wallet_units'] = max(0, fund['wallet_units'] - record['amount_units'])
             self.store.put(_PAYOUTS, found_key, record)
             self._save_fund(fund)
+            return record
+
+    def _payout_record(self, payout_id: str) -> tuple[str, dict]:
+        for key, value in self.store.list_items(_PAYOUTS):
+            if value.get('id') == payout_id:
+                return key, value
+        raise FundError('unknown_payout')
+
+    def manual_refund_cash(self, payout_id: str, *, wallet_units: int | None = None) -> dict:
+        """Whether a queued manual refund may be paid from genuinely free cash.
+
+        The refund's own amount is already booked as a liability, so it may be
+        paid only when the wallet still covers every *other* obligation the fund
+        carries -- pending receipts, prepaid institution fees, other unclaimed
+        money and other declared payouts.  Investor money is never diverted.
+        """
+        _, payout = self._payout_record(payout_id)
+        amount = int(payout['amount_units'])
+        fund = self._fund(payout['fund_id'])
+        if wallet_units is not None:
+            if isinstance(wallet_units, bool) or not isinstance(wallet_units, int) or wallet_units < 0:
+                raise FundError('invalid_balance')
+            fund = dict(fund, wallet_units=min(fund['wallet_units'], wallet_units))
+        available = self._available_cash(fund) + amount
+        ok = amount > 0 and available >= amount
+        return {
+            'fund_id': payout['fund_id'],
+            'amount_units': amount,
+            'available_units': available,
+            'ok': ok,
+            'reason': None if ok else 'available_cash_shortage',
+        }
+
+    def mark_payout_sending(self, payout_id: str, now_ms) -> dict:
+        """Persist the intent *before* the external transfer leaves the process."""
+        now = _as_ms(now_ms)
+        with self.store.transaction():
+            key, record = self._payout_record(payout_id)
+            if record.get('status') == 'paid':
+                return record
+            record['status'] = 'sending'
+            record['sending_ms'] = now
+            record['updated_ms'] = now
+            record.pop('waiting_reason', None)
+            self.store.put(_PAYOUTS, key, record)
+            return record
+
+    def mark_payout_uncertain(self, payout_id: str, reason, now_ms) -> dict:
+        """Record an unconcluded attempt; the payout stays open for reconciliation."""
+        now = _as_ms(now_ms)
+        code = _as_text(reason)[:64] or 'unknown'
+        with self.store.transaction():
+            key, record = self._payout_record(payout_id)
+            if record.get('status') == 'paid':
+                return record
+            record['status'] = 'uncertain'
+            record['waiting_reason'] = code
+            record['updated_ms'] = now
+            self.store.put(_PAYOUTS, key, record)
+            return record
+
+    def mark_payout_waiting(self, payout_id: str, reason, now_ms) -> dict:
+        """Keep a payout pending with a durable reason (for example no free cash)."""
+        now = _as_ms(now_ms)
+        code = _as_text(reason)[:64] or 'unknown'
+        with self.store.transaction():
+            key, record = self._payout_record(payout_id)
+            if record.get('status') == 'paid':
+                return record
+            record['waiting_reason'] = code
+            record['waiting_ms'] = now
+            record['updated_ms'] = now
+            self.store.put(_PAYOUTS, key, record)
             return record
 
     # -------------------------------------------------------------------- orders

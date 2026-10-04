@@ -2,6 +2,6 @@
 
 - [推广文案](推广文案.md)：可直接阅读或复制的简洁图文版。
 - 配图：`assets/execution_stress.png`，正常与已测执行压力下的年化及回撤对比。
-- 来源：[研究报告](../docs/INTRODUCTION.md)，使用最终版本回测数据。
+- 来源：[研究报告](../docs/funds/INTRODUCTION.md)，使用最终版本回测数据。
 
 用支持本地图片的 Markdown 阅读器打开文案。分享时保留数字对应的回测口径、回撤与文末数据说明，并一并携带 `assets/` 图片目录。

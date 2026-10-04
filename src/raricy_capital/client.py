@@ -316,12 +316,16 @@ class FundSiteClient:
         """游标拉取流水（``id > since_id``，升序，最多 100 行）。
 
         返回 ``{'transactions', 'next_cursor', 'has_more'}``；每行是规范化后的
-        dict：``id`` / ``transfer_id`` / ``from_user_id`` / ``amount_units``（有符号）
-        / ``note`` / ``occurred_ms``（真实 UTC 毫秒）/ ``type``。
+        dict：``id`` / ``transaction_row_id`` / ``transfer_id`` / ``from_user_id``
+        / ``to_user_id`` / ``amount_units``（有符号）/ ``note`` / ``occurred_ms``
+        （真实 UTC 毫秒）/ ``type``。
 
         ``from_user_id`` 是**权威**的对方身份：收款行取站点填的
         ``related_user_id``；支出行取本账户自身 ID。绝不从用户名或备注猜人
-        （docs/bot/fish-bank-example.md §5 第 2 条）。
+        （docs/bot/fish-bank-example.md §5 第 2 条）。``to_user_id`` 同源：支出行取
+        ``related_user_id``（退款对账要核对收款人），收款行就是本账户。
+        ``transaction_row_id`` 与 ``id`` 同值，是未认领款补链与权威回查的稳定行键
+        —— 站点不提供反向查询，有行号就不必从 0 重扫全量历史。
         """
         await self._ensure_login()
         if isinstance(since_id, bool) or not isinstance(since_id, int) or since_id < 0:
@@ -349,18 +353,29 @@ class FundSiteClient:
     def _normalize_transaction(self, row: Mapping) -> dict:
         row_type = row.get("type") if isinstance(row.get("type"), str) else ""
         related = row.get("related_user_id")
+        related_id = related if isinstance(related, str) and related else None
         if row_type == "transfer_receive":
-            from_user_id = related if isinstance(related, str) and related else None
+            # 收款行：对方是付款人，收款人是本账户。
+            from_user_id = related_id
+            to_user_id = self._user_id
         elif row_type == "transfer":
+            # 支出行：付款人是本账户，对方（related_user_id）是收款人。
+            # 退款对账必须核对收款人是不是原付款人，所以这里必须保留。
             from_user_id = self._user_id
+            to_user_id = related_id
         else:
-            from_user_id = related if isinstance(related, str) and related else None
+            from_user_id = related_id
+            to_user_id = None
         transfer_id = row.get("transfer_id")
         tx_id = row.get("id")
+        row_id = tx_id if isinstance(tx_id, int) and not isinstance(tx_id, bool) else None
         return {
-            "id": tx_id if isinstance(tx_id, int) and not isinstance(tx_id, bool) else None,
+            "id": row_id,
+            # 同一个稳定行键：补链/回查都按它快速定位，缺失时才退回有界扫描。
+            "transaction_row_id": row_id,
             "transfer_id": transfer_id if isinstance(transfer_id, str) and transfer_id else None,
             "from_user_id": from_user_id,
+            "to_user_id": to_user_id,
             "amount_units": _as_units(row.get("amount")),
             "note": _extract_note(row.get("description"), row_type),
             "occurred_ms": _occurred_ms(row.get("created_at")),

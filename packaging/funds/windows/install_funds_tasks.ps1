@@ -102,7 +102,7 @@ if ($PSCmdlet.ShouldProcess("RaricyFundsService", "注册计划任务（不启�
     Write-Host "未启动任何服务。检查后手工启动：Start-ScheduledTask -TaskName RaricyFundsService"
     Write-Host "凭据请通过当前用户环境变量或独立凭据文件提供，切勿写进任务。"
     Write-Host "备份：服务内部每小时执行；也可在控制台触发已认证的 POST /api/backup。"
-    Write-Host "完整步骤与人工验收清单见docs/DEPLOYMENT.md。"
+    Write-Host "完整步骤与人工验收清单见docs/usage/DEPLOYMENT.md。"
 } else {
     Write-Host "（未执行注册：-WhatIf 或已取消。没有生成配置、没有注销或注册任务、也没有启动服务。）"
 }

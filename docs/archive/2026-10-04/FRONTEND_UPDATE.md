@@ -1,4 +1,8 @@
-# 前端更新说明
+# 前端更新说明（历史记录）
+
+本文记录早期静态界面更新。人工核对随后已实现，现行用法见
+[操作手册](../../usage/UNCLAIMED_REVIEW.md)，部署见 [部署指南](../../usage/DEPLOYMENT.md)。
+本文的旧静态更新包只覆盖当时的三份前端文件，不能用于发布完整人工核对功能。
 
 ## 本轮内容
 
@@ -7,7 +11,7 @@
 - 登录后每 5 秒刷新，保留表单输入与展开状态；退出后隐藏运营数据。
 - 显示账号恢复、结算积压和网络检测状态；无净值数据时显示空状态。
 
-本轮只修改 `src/raricy_capital/static/` 的三个文件。未认领款功能仍为待审阅方案，见 [UNCLAIMED_REVIEW_PLAN.md](UNCLAIMED_REVIEW_PLAN.md)。
+本轮只修改 `src/raricy_capital/static/` 的三个文件。未认领款功能仍为待审阅方案，见 [人工核对设计](../../design/UNCLAIMED_REVIEW.md)。
 
 ## 当前验证与发布边界
 

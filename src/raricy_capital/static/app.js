@@ -64,6 +64,25 @@ function formatTime(ms) {
   }
 }
 
+//: Reads the first present, non-empty field. Receipt, candidate and history
+//: payloads use the documented names; the short alias lists only absorb older
+//: rows written before the upstream transfer link was stored.
+function pick(source, ...keys) {
+  if (!source || typeof source !== "object") return undefined;
+  for (const key of keys) {
+    const value = source[key];
+    if (value !== undefined && value !== null && value !== "") return value;
+  }
+  return undefined;
+}
+
+function textOf(value, fallback) {
+  if (value === undefined || value === null || value === "") {
+    return fallback === undefined ? "—" : fallback;
+  }
+  return String(value);
+}
+
 function stateBadge(fund) {
   // The operational state comes from the trader phase in the root status snapshot
   // (`fund.trader.phase`): halted / stopped / daily_pause / blocked / holding / flat.
@@ -193,6 +212,7 @@ function clearConsoleData() {
   state.funds = [];
   state.lastStatus = null;
   updateFilterOptions([]);
+  resetUnclaimedPanel();
 }
 
 function showLogin() {
@@ -816,6 +836,15 @@ function updateBadges(status) {
     else { liveBadge.dataset.state = "unknown"; liveBadge.textContent = "模式未知"; }
   }
 
+  // The unclaimed panel repeats the gate where it matters: with live=false the
+  // operator can verify and preview, but the final resolve is disabled.
+  const unclaimedBadge = el("unclaimed-mode");
+  if (unclaimedBadge) {
+    if (status.live === true) { unclaimedBadge.dataset.state = "warn"; unclaimedBadge.textContent = "处理已启用"; }
+    else if (status.live === false) { unclaimedBadge.dataset.state = "ok"; unclaimedBadge.textContent = "只读预览 · 仅核对"; }
+    else { unclaimedBadge.dataset.state = "unknown"; unclaimedBadge.textContent = "模式未知"; }
+  }
+
   const netBadge = el("net-badge");
   if (!netBadge) return;
   const network = status.network || {};
@@ -849,6 +878,1008 @@ function updateFilterOptions(funds) {
   if (select.value !== previous) select.value = "";
 }
 
+// ------------------------------------------------------- unclaimed review
+//
+// Receipts that could not be matched to a subscription wait here for a human
+// decision: link the money to the one existing subscription it really belongs
+// to, or refund it in full to the original payer. The console only uses the
+// documented endpoints:
+//   GET  /api/unclaimed?fund_id=&status=
+//   GET  /api/funds/{fund_id}/unclaimed/{id}
+//   POST /api/funds/{fund_id}/unclaimed/{id}/preview  {action, subscription_id?}
+//   POST /api/funds/{fund_id}/unclaimed/{id}/resolve  {action, subscription_id?, version, reason}
+// The server re-reads the authoritative upstream receipt and commits with an
+// atomic version check, so this client holds no editing lease: "reviewing" is
+// transient local state, and a version conflict means the record changed under
+// us and has to be read and confirmed again. Actor identity is derived by the
+// server from the session; the payload never carries it.
+
+const UNCLAIMED_ACTIONS = { link: "关联已有申购单", refund: "原路全额退款" };
+
+//: List rows are compared through a joined signature. The separators are control
+//: characters built from their code points so the source stays plain text and a
+//: row field can never produce the separator itself.
+const UNCLAIMED_FIELD_SEP = String.fromCharCode(1);
+const UNCLAIMED_ROW_SEP = String.fromCharCode(2);
+
+const unclaimed = {
+  fundId: "",
+  status: "",
+  rows: [],
+  listSignature: null,
+  selected: null,       // {fundId, id}
+  detail: null,         // receipt detail from GET .../unclaimed/{id}
+  preview: null,        // {preview, live} from POST .../preview
+  subscriptionId: "",   // operator's candidate choice (never inferred)
+  busy: false,
+  note: "",
+};
+
+//: Operational wording matters here: nothing at this stage is a completed
+//: payout, so a queued refund is never shown as paid, and an unknown payout
+//: result is shown as "needs reconciliation" instead of success.
+function unclaimedStatusInfo(record) {
+  const raw = String(pick(record, "resolution_status", "status") || "").toLowerCase();
+  if (raw === "unclaimed" || raw === "unresolved" || raw === "") return { tone: "warn", text: "待核对" };
+  if (raw === "linked") return { tone: "ok", text: "已关联申购单" };
+  if (raw === "refund_queued") {
+    const waiting = unclaimedWaitingReason(record);
+    return { tone: "warn", text: waiting ? `退款已排队 · ${waiting}` : "退款已排队 · 尚未付款" };
+  }
+  if (raw === "refund_unknown") return { tone: "bad", text: "退款结果待确认（未知，需先对账）" };
+  if (raw === "refunded") return { tone: "ok", text: "已退款" };
+  return { tone: "unknown", text: `状态未知（${raw}）` };
+}
+
+function unclaimedWaitingReason(record) {
+  const payout = record && typeof record.payout === "object" && record.payout ? record.payout : {};
+  const raw = pick(record, "waiting_reason", "hold_reason", "payout_reason")
+    || pick(payout, "waiting_reason", "hold_reason", "reason", "status_reason");
+  if (raw === undefined) return "";
+  const text = String(raw);
+  if (/cash|现金|insufficient|balance/i.test(text)) return `等待可用现金（${text}）`;
+  return `等待付款（${text}）`;
+}
+
+function isUnresolvedRow(row) {
+  const raw = String(pick(row, "resolution_status", "status") || "unclaimed").toLowerCase();
+  return raw === "unclaimed" || raw === "unresolved";
+}
+
+function unclaimedAmountUnits(record) {
+  return pick(record, "amount_units", "amount");
+}
+
+function unclaimedPayer(record) {
+  return pick(record, "from_user_id", "payer_user_id", "payer_id");
+}
+
+function unclaimedArrival(record) {
+  return pick(record, "occurred_ms", "arrived_ms", "occurred_at_ms");
+}
+
+function unclaimedNote(record) {
+  const note = pick(record, "note_original", "note", "memo");
+  if (note === undefined) return "（无附言）";
+  const text = String(note);
+  return text ? text : "（空附言）";
+}
+
+function unclaimedVersion(record) {
+  const value = Number(pick(record, "version"));
+  return Number.isFinite(value) && value >= 0 ? value : 0;
+}
+
+function sumUnits(rows) {
+  let total = 0n;
+  for (const row of rows) {
+    try {
+      total += BigInt(String(unclaimedAmountUnits(row)).trim().split(".")[0]);
+    } catch (err) { /* unparsable row amounts are simply not summed */ }
+  }
+  return total.toString();
+}
+
+//: Same in-place discipline as the fund cards: rows are rebuilt only when their
+//: content really changed, so a 5-second poll keeps focus, hover and scroll.
+function unclaimedListSignature() {
+  const parts = unclaimed.rows.map((row) => [
+    textOf(pick(row, "id", "unclaimed_id")),
+    textOf(pick(row, "fund_id")),
+    textOf(unclaimedAmountUnits(row)),
+    textOf(unclaimedArrival(row)),
+    textOf(unclaimedPayer(row)),
+    textOf(pick(row, "note", "memo"), ""),
+    unclaimedStatusInfo(row).text,
+  ].join(UNCLAIMED_FIELD_SEP));
+  parts.push(unclaimed.selected ? `${unclaimed.selected.fundId}/${unclaimed.selected.id}` : "");
+  return parts.join(UNCLAIMED_ROW_SEP);
+}
+
+function renderUnclaimedSummary(data) {
+  const summary = el("unclaimed-summary");
+  if (!summary) return;
+  const rows = unclaimed.rows;
+  const parsed = Number(data && data.count);
+  const count = Number.isFinite(parsed) ? parsed : rows.length;
+  const totalUnits = data && data.total_units !== undefined ? formatMoney(data.total_units) : formatMoney(sumUnits(rows));
+  const unresolved = rows.filter(isUnresolvedRow);
+
+  const strong = (text) => {
+    const node = document.createElement("strong");
+    node.textContent = text;
+    return node;
+  };
+  summary.replaceChildren();
+  summary.append(
+    document.createTextNode("筛选结果 "), strong(String(count)),
+    document.createTextNode(" 笔 · 合计 "), strong(totalUnits),
+    document.createTextNode(" 小鱼干 · 待核对 "), strong(String(unresolved.length)),
+    document.createTextNode(" 笔 · "), strong(formatMoney(sumUnits(unresolved))),
+    document.createTextNode(" 小鱼干"),
+  );
+  if (unclaimed.status === "linked" || unclaimed.status === "refund_queued") {
+    summary.append(document.createTextNode("（待核对数量只统计当前筛选结果）"));
+  }
+  if (count !== rows.length) summary.append(document.createTextNode(`（已显示 ${rows.length} 笔）`));
+}
+
+function renderUnclaimedMessage(message) {
+  const summary = el("unclaimed-summary");
+  if (summary) summary.textContent = message;
+}
+
+function renderUnclaimedList() {
+  const list = el("unclaimed-list");
+  if (!list) return;
+  const signature = unclaimedListSignature();
+  if (signature === unclaimed.listSignature) return;  // nothing moved: keep the DOM
+  unclaimed.listSignature = signature;
+  list.replaceChildren();
+
+  if (!unclaimed.rows.length) {
+    list.append(emptyListItem("没有符合条件的未认领款"));
+    return;
+  }
+
+  for (const row of unclaimed.rows) {
+    const fundId = textOf(pick(row, "fund_id"), "");
+    const id = textOf(pick(row, "id", "unclaimed_id"), "");
+    const info = unclaimedStatusInfo(row);
+
+    const li = document.createElement("li");
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "unclaimed-row";
+    if (unclaimed.selected && unclaimed.selected.id === id && unclaimed.selected.fundId === fundId) {
+      button.dataset.selected = "true";
+      button.setAttribute("aria-current", "true");
+    }
+
+    const meta = document.createElement("span");
+    meta.className = "row-meta";
+    meta.textContent = `${formatTime(unclaimedArrival(row))} · ${fundId || "未知基金"}`;
+
+    const amount = document.createElement("span");
+    amount.className = "row-amount";
+    amount.textContent = `${formatMoney(unclaimedAmountUnits(row))} 小鱼干`;
+
+    const note = document.createElement("span");
+    note.className = "row-note";
+    note.textContent = `付款人 ${textOf(unclaimedPayer(row))} · ${unclaimedNote(row)}`;
+
+    const badge = document.createElement("span");
+    badge.className = "badge row-status";
+    badge.dataset.state = info.tone;
+    badge.textContent = info.text;
+
+    button.append(meta, amount, note, badge);
+    button.addEventListener("click", () => selectUnclaimed(fundId, id));
+    li.append(button);
+    list.append(li);
+  }
+}
+
+function renderUnclaimedFacts(container, record) {
+  if (!container) return;
+  container.replaceChildren();
+  if (!record) return;
+  for (const [label, value] of unclaimedFacts(record)) {
+    addMetric(container, label, value);
+  }
+}
+
+function unclaimedFacts(record) {
+  const facts = [
+    ["流水 ID", textOf(pick(record, "id", "unclaimed_id"))],
+    ["上游流水号", textOf(pick(record, "transfer_id"), "未记录")],
+    ["交易记录行", textOf(pick(record, "transaction_row_id"), "未记录")],
+    ["基金", textOf(pick(record, "fund_id"))],
+    ["付款人 ID", textOf(unclaimedPayer(record))],
+    ["金额（小鱼干，不可修改）", formatMoney(unclaimedAmountUnits(record))],
+    ["权威到账时间", formatTime(unclaimedArrival(record))],
+    ["登记时间", formatTime(pick(record, "created_ms", "created_at_ms"))],
+    ["原始附言（保留原文）", unclaimedNote(record)],
+    ["记录版本", String(unclaimedVersion(record))],
+  ];
+  const subscriptionId = pick(record, "subscription_id");
+  if (subscriptionId !== undefined) facts.push(["已关联申购单", textOf(subscriptionId)]);
+  const payoutId = pick(record, "payout_id", "refund_payout_id", "payment_id");
+  if (payoutId !== undefined) facts.push(["退款付款单", textOf(payoutId)]);
+  const resolutionReason = pick(record, "resolution_reason", "reason");
+  if (resolutionReason !== undefined) facts.push(["处理理由", textOf(resolutionReason)]);
+  const resolvedMs = pick(record, "resolved_ms", "resolved_at_ms");
+  if (resolvedMs !== undefined) facts.push(["处理时间", formatTime(resolvedMs)]);
+  return facts;
+}
+
+function candidateId(candidate) {
+  return textOf(pick(candidate, "subscription_id", "id", "order_id"), "");
+}
+
+function candidateReasons(candidate) {
+  const raw = pick(candidate, "reasons", "errors", "blocked_reasons", "mismatch_reasons");
+  if (raw === undefined) return [];
+  const list = Array.isArray(raw) ? raw : [raw];
+  return list.map((item) => textOf(item, "")).filter((item) => item !== "");
+}
+
+//: Conservative by default: a candidate is selectable only when it says so
+//: explicitly, or when nothing is said at all. Anything flagged or explained is
+//: left for the refund / hold decision instead of being linked on a guess.
+function candidateEligible(candidate) {
+  const blocked = candidateReasons(candidate).length > 0;
+  return candidate.eligible === true || (candidate.eligible === undefined && !blocked);
+}
+
+function renderUnclaimedCandidates() {
+  const container = el("unclaimed-candidates");
+  if (!container) return;
+  container.replaceChildren();
+  const candidates = unclaimed.detail && Array.isArray(unclaimed.detail.candidates)
+    ? unclaimed.detail.candidates.filter((item) => item && typeof item === "object")
+    : [];
+  if (!candidates.length) {
+    container.append(emptyListItem("没有候选申购单：请选择原路全额退款，或保持待核对等待更多证据"));
+    return;
+  }
+  // A resolved receipt keeps its candidates visible as history, but nothing can
+  // be picked any more.
+  const locked = !unclaimed.detail || !isUnresolvedRow(unclaimed.detail);
+  candidates.forEach((candidate, index) => {
+    const id = candidateId(candidate);
+    const eligible = candidateEligible(candidate) && id !== "";
+    const reasons = candidateReasons(candidate);
+
+    const li = document.createElement("li");
+    li.dataset.eligible = eligible ? "true" : "false";
+
+    const head = document.createElement("div");
+    head.className = "candidate-head";
+    const radio = document.createElement("input");
+    radio.type = "radio";
+    radio.name = "unclaimed-candidate";
+    radio.id = `unclaimed-candidate-${index}`;
+    radio.value = id;
+    radio.disabled = !eligible || locked;
+    const label = document.createElement("label");
+    label.htmlFor = radio.id;
+    const tag = locked ? " · 已处理" : eligible ? " · 可关联" : " · 不可关联";
+    label.textContent = `${id ? `申购单 ${id}` : "缺少申购单 ID"}${tag}`;
+    head.append(radio, label);
+    li.append(head);
+
+    const meta = document.createElement("p");
+    meta.className = "candidate-meta";
+    const metaBits = [
+      `申购人 ${textOf(pick(candidate, "user_id", "from_user_id"))}`,
+      `订单金额 ${formatMoney(pick(candidate, "total_units", "amount_units", "paid_units", "amount"))} 小鱼干`,
+      `订单状态 ${textOf(pick(candidate, "status", "state"))}`,
+      `订单创建 ${formatTime(pick(candidate, "created_ms", "created_at_ms"))}`,
+      `有效期至 ${formatTime(pick(candidate, "expires_ms", "expires_at_ms"))}`,
+    ];
+    meta.textContent = metaBits.join(" · ");
+    li.append(meta);
+
+    if (reasons.length) {
+      const list = document.createElement("ul");
+      list.className = "unclaimed-reasons";
+      for (const reason of reasons) {
+        const item = document.createElement("li");
+        item.textContent = reason;
+        list.append(item);
+      }
+      li.append(list);
+    }
+    container.append(li);
+  });
+  restoreUnclaimedCandidateSelection();
+}
+
+function restoreUnclaimedCandidateSelection() {
+  const container = el("unclaimed-candidates");
+  if (!container) return;
+  for (const input of container.querySelectorAll('input[name="unclaimed-candidate"]')) {
+    input.checked = !input.disabled && input.value !== "" && input.value === unclaimed.subscriptionId;
+  }
+}
+
+function renderUnclaimedHistory() {
+  const container = el("unclaimed-history");
+  if (!container) return;
+  container.replaceChildren();
+  const history = unclaimed.detail && Array.isArray(unclaimed.detail.history)
+    ? unclaimed.detail.history.filter((item) => item && typeof item === "object")
+    : [];
+  if (!history.length) {
+    container.append(emptyListItem("暂无核对或处理记录"));
+    return;
+  }
+  for (const entry of history) {
+    const li = document.createElement("li");
+    const head = document.createElement("div");
+    head.className = "history-head";
+    const time = document.createElement("span");
+    time.className = "history-time";
+    time.textContent = formatTime(pick(entry, "created_ms", "time_ms", "t_ms", "at_ms", "occurred_ms"));
+    const action = document.createElement("span");
+    action.className = "history-action";
+    action.textContent = textOf(pick(entry, "action", "kind", "event", "resolution", "status"), "记录");
+    head.append(time, action);
+    li.append(head);
+
+    const reason = pick(entry, "reason", "note", "detail");
+    if (reason !== undefined) {
+      const node = document.createElement("span");
+      node.className = "history-reason";
+      node.textContent = `理由：${textOf(reason, "（未记录）")}`;
+      li.append(node);
+    }
+
+    const metaBits = [];
+    const from = pick(entry, "from_status", "previous_status");
+    const to = pick(entry, "to_status", "new_status", "resolution_status");
+    if (from !== undefined || to !== undefined) metaBits.push(`${textOf(from, "?")} → ${textOf(to, "?")}`);
+    const subscriptionId = pick(entry, "subscription_id");
+    if (subscriptionId !== undefined) metaBits.push(`申购单 ${textOf(subscriptionId)}`);
+    const payoutId = pick(entry, "payout_id", "payout_business_key", "payment_id");
+    if (payoutId !== undefined) metaBits.push(`付款单 ${textOf(payoutId)}`);
+    const version = pick(entry, "version");
+    if (version !== undefined) metaBits.push(`版本 ${textOf(version)}`);
+    // The actor is an opaque server-derived session hash, never a person and
+    // never a credential: it is shown so two operators can tell entries apart.
+    const actor = pick(entry, "actor", "actor_hash", "actor_id", "operator");
+    if (actor !== undefined) metaBits.push(`管理会话 ${textOf(actor)}`);
+    if (metaBits.length) {
+      const meta = document.createElement("span");
+      meta.className = "history-meta";
+      meta.textContent = metaBits.join(" · ");
+      li.append(meta);
+    }
+    container.append(li);
+  }
+}
+
+function currentUnclaimedAction() {
+  const refund = el("unclaimed-action-refund");
+  return refund && refund.checked ? "refund" : "link";
+}
+
+function currentUnclaimedCandidate() {
+  const container = el("unclaimed-candidates");
+  if (container) {
+    const checked = container.querySelector('input[name="unclaimed-candidate"]:checked');
+    if (checked && checked.value) return checked.value;
+  }
+  return unclaimed.subscriptionId || "";
+}
+
+function unclaimedDirty() {
+  const reason = el("unclaimed-reason");
+  return unclaimed.preview !== null || (reason !== null && reason.value.trim() !== "");
+}
+
+//: While the operator is typing or has a preview on screen, polling must not
+//: rewrite the detail: the draft stays exactly as typed and re-render waits.
+function unclaimedReviewActive() {
+  if (unclaimed.detail && !isUnresolvedRow(unclaimed.detail)) return false;
+  if (unclaimedDirty()) return true;
+  const detail = el("unclaimed-detail");
+  const active = document.activeElement;
+  return !!(detail && active && active !== document.body && detail.contains(active));
+}
+
+function showUnclaimedError(message) {
+  const node = el("unclaimed-error");
+  if (!node) return;
+  node.hidden = false;
+  node.textContent = message;
+}
+
+function clearUnclaimedError() {
+  const node = el("unclaimed-error");
+  if (!node) return;
+  node.hidden = true;
+  node.textContent = "";
+}
+
+function setUnclaimedNote(text) {
+  unclaimed.note = text || "";
+  const node = el("unclaimed-draft-note");
+  if (!node) return;
+  node.hidden = !unclaimed.note;
+  node.textContent = unclaimed.note;
+}
+
+function setUnclaimedBusy(busy, label) {
+  unclaimed.busy = busy;
+  const button = el("unclaimed-preview-btn");
+  if (button) {
+    button.disabled = busy;
+    button.textContent = busy ? (label || "正在核对…") : "核对预览";
+  }
+  updateUnclaimedSubmitState();
+}
+
+function resetUnclaimedForm() {
+  const reason = el("unclaimed-reason");
+  if (reason) reason.value = "";
+  const check = el("unclaimed-confirm-check");
+  if (check) check.checked = false;
+  unclaimed.preview = null;
+  unclaimed.subscriptionId = "";
+  unclaimed.note = "";
+  clearUnclaimedError();
+  setUnclaimedNote("");
+  restoreUnclaimedCandidateSelection();
+  renderUnclaimedPreview();
+}
+
+function closeUnclaimedDetail() {
+  unclaimed.selected = null;
+  unclaimed.detail = null;
+  resetUnclaimedForm();
+  const detail = el("unclaimed-detail");
+  if (detail) detail.hidden = true;
+  unclaimed.listSignature = null;
+  renderUnclaimedList();
+}
+
+//: Everything that can identify a receipt, a draft or a preview is dropped when
+//: the console closes: nothing about an operator's review survives a logout.
+function resetUnclaimedPanel() {
+  unclaimed.fundId = "";
+  unclaimed.status = "";
+  unclaimed.rows = [];
+  unclaimed.listSignature = null;
+  unclaimed.selected = null;
+  unclaimed.detail = null;
+  unclaimed.preview = null;
+  unclaimed.subscriptionId = "";
+  unclaimed.busy = false;
+  unclaimed.note = "";
+  unclaimedReviewInputs(false);
+  const list = el("unclaimed-list");
+  if (list) list.replaceChildren();
+  const detail = el("unclaimed-detail");
+  if (detail) detail.hidden = true;
+  for (const id of ["unclaimed-fields", "unclaimed-candidates", "unclaimed-history",
+    "unclaimed-preview-fields", "unclaimed-preview-errors", "unclaimed-confirm-list"]) {
+    const node = el(id);
+    if (node) node.replaceChildren();
+  }
+  const preview = el("unclaimed-preview");
+  if (preview) preview.hidden = true;
+  const reason = el("unclaimed-reason");
+  if (reason) reason.value = "";
+  const check = el("unclaimed-confirm-check");
+  if (check) {
+    check.checked = false;
+    check.disabled = true;
+  }
+  const button = el("unclaimed-resolve-btn");
+  if (button) {
+    button.disabled = true;
+    button.textContent = "确认提交处理";
+  }
+  const liveHint = el("unclaimed-live-hint");
+  if (liveHint) liveHint.hidden = true;
+  const mode = el("unclaimed-mode");
+  if (mode) {
+    mode.dataset.state = "unknown";
+    mode.textContent = "模式未知";
+  }
+  const statusFilter = el("unclaimed-status-filter");
+  if (statusFilter) statusFilter.value = "";
+  const fundFilter = el("unclaimed-fund-filter");
+  if (fundFilter) fundFilter.value = "";
+  clearUnclaimedError();
+  setUnclaimedNote("");
+  renderUnclaimedMessage("尚未加载未认领款。");
+  updateUnclaimedFundOptions([]);
+}
+
+function unclaimedReviewInputs(enabled) {
+  for (const id of ["unclaimed-preview-btn", "unclaimed-action-link", "unclaimed-action-refund"]) {
+    const node = el(id);
+    if (node) node.disabled = enabled === false;
+  }
+  const reason = el("unclaimed-reason");
+  if (reason) reason.disabled = enabled === false;
+}
+
+function selectUnclaimed(fundId, id) {
+  if (!fundId || !id) return;
+  unclaimed.selected = { fundId, id };
+  unclaimed.detail = null;
+  unclaimed.preview = null;
+  unclaimed.subscriptionId = "";
+  const reason = el("unclaimed-reason");
+  if (reason) reason.value = "";
+  const check = el("unclaimed-confirm-check");
+  if (check) check.checked = false;
+  clearUnclaimedError();
+  setUnclaimedNote("");
+  unclaimed.listSignature = null;
+  renderUnclaimedList();
+  const epoch = sessionEpoch;
+  loadUnclaimedDetail(epoch, unclaimed.selected, { resetForm: true });
+}
+
+function renderUnclaimedDetailMessage(message) {
+  const detail = el("unclaimed-detail");
+  if (!detail) return;
+  detail.hidden = false;
+  const title = el("unclaimed-detail-title");
+  if (title) title.textContent = "未认领流水详情";
+  const sub = el("unclaimed-detail-sub");
+  if (sub) sub.textContent = message;
+  const badge = el("unclaimed-status-badge");
+  if (badge) {
+    badge.dataset.state = "unknown";
+    badge.textContent = "状态未知";
+  }
+  renderUnclaimedFacts(el("unclaimed-fields"), null);
+  const candidates = el("unclaimed-candidates");
+  if (candidates) {
+    candidates.replaceChildren(emptyListItem("详情未加载：处理入口已停用"));
+  }
+  const history = el("unclaimed-history");
+  if (history) history.replaceChildren(emptyListItem("详情未加载"));
+  unclaimedReviewInputs(false);
+  const preview = el("unclaimed-preview");
+  if (preview) preview.hidden = true;
+}
+
+function renderUnclaimedDetail(options = {}) {
+  const record = unclaimed.detail;
+  if (!record) return;
+  const detail = el("unclaimed-detail");
+  if (detail) detail.hidden = false;
+  // One receipt gets exactly one decision: a resolved row shows its outcome and
+  // history, but the processing form stays disabled instead of offering a retry
+  // the server would reject anyway.
+  const resolved = !isUnresolvedRow(record);
+  const reviewForm = el("unclaimed-form");
+  if (reviewForm) reviewForm.hidden = resolved;
+  unclaimedReviewInputs(!resolved);
+
+  const info = unclaimedStatusInfo(record);
+  const title = el("unclaimed-detail-title");
+  if (title) title.textContent = `未认领流水 ${textOf(pick(record, "id", "unclaimed_id"))}`;
+  const sub = el("unclaimed-detail-sub");
+  if (sub) {
+    sub.textContent = [
+      `基金 ${textOf(pick(record, "fund_id"))}`,
+      `付款人 ${textOf(unclaimedPayer(record))}`,
+      `金额 ${formatMoney(unclaimedAmountUnits(record))} 小鱼干`,
+      `权威到账 ${formatTime(unclaimedArrival(record))}`,
+    ].join(" · ");
+  }
+  const badge = el("unclaimed-status-badge");
+  if (badge) {
+    badge.dataset.state = info.tone;
+    badge.textContent = info.text;
+  }
+
+  renderUnclaimedFacts(el("unclaimed-fields"), record);
+  renderUnclaimedCandidates();
+  renderUnclaimedHistory();
+
+  const candidates = Array.isArray(unclaimed.detail.candidates)
+    ? unclaimed.detail.candidates.filter((item) => item && typeof item === "object")
+    : [];
+  const eligibleCount = candidates.filter(candidateEligible).length;
+  const hint = el("unclaimed-candidate-hint");
+  if (hint) {
+    if (resolved) {
+      hint.textContent = `该流水已处理（${info.text}），不能重复处理：一笔到账只产生一个结果。需要更正时走对账与审计流程，不要覆盖历史结论。`;
+    } else if (currentUnclaimedAction() === "refund") {
+      hint.textContent = "原路全额退款：无需选择申购单，只退给原付款人，金额与到账记录一致；实际进度在本流水详情跟踪。";
+    } else if (eligibleCount) {
+      hint.textContent = `关联处理：请在上方候选申购单中选中要关联的那一单（当前 ${eligibleCount} 单可关联）。金额、到账时间和付款人都不能修改；附言填错可以人工关联，但原始附言会原样保留并写入理由。`;
+    } else {
+      hint.textContent = "没有可关联的候选申购单：只能选择原路全额退款，或保持待核对等待更多证据。系统不会新建、补写或倒签申购单。";
+    }
+  }
+
+  if (options.resetForm === true) {
+    const link = el("unclaimed-action-link");
+    const refund = el("unclaimed-action-refund");
+    if (link && refund) (eligibleCount ? link : refund).checked = true;
+    resetUnclaimedForm();
+  }
+  restoreUnclaimedCandidateSelection();
+  renderUnclaimedPreview();
+}
+
+function updateUnclaimedSubmitState() {
+  const check = el("unclaimed-confirm-check");
+  const button = el("unclaimed-resolve-btn");
+  const hint = el("unclaimed-live-hint");
+  if (!check || !button) return;
+  const preview = unclaimed.preview;
+  const live = !!(preview && preview.live === true);
+  const eligible = !!(preview && preview.preview && preview.preview.eligible === true);
+  let blockedReason = "";
+  if (unclaimed.busy) blockedReason = "正在提交处理…";
+  else if (!preview) blockedReason = "请先执行核对预览，再提交处理。";
+  else if (!live) blockedReason = "当前为只读预览：可以核对，但不能提交处理；账务与退款队列不会发生变化。";
+  else if (!eligible) blockedReason = "预览未通过：处理条件不满足，请修正后重新预览，或改用其它处理方式。";
+
+  const blocked = blockedReason !== "" && (unclaimed.busy || !preview || !live || !eligible);
+  check.disabled = blocked;
+  if (blocked) check.checked = false;
+  button.disabled = blocked || !check.checked;
+  button.textContent = unclaimed.busy ? "正在提交…" : "确认提交处理";
+  if (hint) {
+    const text = blockedReason && preview ? blockedReason : "";
+    hint.hidden = text === "";
+    hint.textContent = text;
+  }
+}
+
+//: A draft in the form is never thrown away by a background refresh; the note
+//: tells the operator why the detail stopped auto-updating.
+function unclaimedDraftNote() {
+  if (unclaimed.preview) return "";
+  const reason = el("unclaimed-reason");
+  if (!reason || reason.value.trim() === "") return "";
+  return "草稿已保留：自动刷新不会覆盖正在填写的内容；提交前需要先执行核对预览。";
+}
+
+function invalidateUnclaimedPreview(message) {
+  const hadPreview = unclaimed.preview !== null;
+  unclaimed.preview = null;
+  if (hadPreview) renderUnclaimedPreview();
+  setUnclaimedNote(hadPreview && message ? message : unclaimedDraftNote());
+}
+
+function renderPreviewFacts() {
+  const container = el("unclaimed-preview-fields");
+  if (!container) return;
+  container.replaceChildren();
+  const preview = unclaimed.preview ? unclaimed.preview.preview : null;
+  if (!preview) return;
+  const record = preview.record && typeof preview.record === "object" ? preview.record : (unclaimed.detail || {});
+  for (const [label, value] of unclaimedFacts(record)) addMetric(container, label, value);
+  const subscription = preview.subscription && typeof preview.subscription === "object" ? preview.subscription : null;
+  if (subscription) {
+    addMetric(container, "预览匹配申购单", textOf(pick(subscription, "subscription_id", "id")));
+    addMetric(container, "申购人", textOf(pick(subscription, "user_id", "from_user_id")));
+    addMetric(container, "订单金额（小鱼干）", formatMoney(pick(subscription, "total_units", "amount_units", "paid_units", "amount")));
+    addMetric(container, "订单状态", textOf(pick(subscription, "status", "state")));
+    addMetric(container, "订单创建", formatTime(pick(subscription, "created_ms", "created_at_ms")));
+    addMetric(container, "有效期至", formatTime(pick(subscription, "expires_ms", "expires_at_ms")));
+  }
+}
+
+function renderConfirmRows(reason) {
+  const container = el("unclaimed-confirm-list");
+  if (!container) return;
+  container.replaceChildren();
+  const preview = unclaimed.preview ? unclaimed.preview.preview : null;
+  if (!preview) return;
+  const detail = unclaimed.detail || {};
+  const record = preview.record && typeof preview.record === "object" ? preview.record : detail;
+  const action = currentUnclaimedAction();
+  const amount = `${formatMoney(unclaimedAmountUnits(record))} 小鱼干`;
+  const version = unclaimedVersion(pick(preview.record, "version") !== undefined ? preview.record : detail);
+  const rows = [
+    ["处理方式", UNCLAIMED_ACTIONS[action] || action],
+    ["基金 / 流水", `${textOf(pick(record, "fund_id"))} / ${textOf(pick(record, "id", "unclaimed_id"))}`],
+    ["付款人（原始）", textOf(unclaimedPayer(record))],
+    ["金额（不可修改）", amount],
+    ["权威到账时间", formatTime(unclaimedArrival(record))],
+    ["原始附言（保留）", unclaimedNote(record)],
+  ];
+  if (action === "link") {
+    const subscription = preview.subscription && typeof preview.subscription === "object"
+      ? preview.subscription : null;
+    rows.push(["关联申购单", textOf(pick(subscription || {}, "subscription_id", "id"), currentUnclaimedCandidate() || "未选择")]);
+    rows.push(["处理结果", "转为待确认申购；份额与资本流入仍由既有月末流程发行，净值不受影响"]);
+  } else {
+    rows.push(["退款去向", `只退回原付款人 ${textOf(unclaimedPayer(record))}，金额 ${amount}，不能分期或改额`]);
+    rows.push(["处理结果", "生成一笔付款队列（排队不等于已付款）；实际结果在本流水详情跟踪，未知结果需先对账"]);
+  }
+  rows.push(["处理理由", reason]);
+  rows.push(["记录版本", `${version}（提交时按该版本做原子校验，期间被他人处理会要求重新核对）`]);
+
+  for (const [label, value] of rows) {
+    const li = document.createElement("li");
+    const left = document.createElement("span");
+    left.className = "confirm-label";
+    left.textContent = label;
+    const right = document.createElement("span");
+    right.className = "confirm-value";
+    right.textContent = value;
+    li.append(left, right);
+    container.append(li);
+  }
+}
+
+function renderUnclaimedPreview(reasonOverride) {
+  const section = el("unclaimed-preview");
+  if (!section) return;
+  const preview = unclaimed.preview ? unclaimed.preview.preview : null;
+  if (!preview) {
+    section.hidden = true;
+    updateUnclaimedSubmitState();
+    return;
+  }
+  section.hidden = false;
+
+  const record = unclaimed.detail || {};
+  const reason = reasonOverride !== undefined
+    ? reasonOverride
+    : (el("unclaimed-reason") ? el("unclaimed-reason").value.trim() : "");
+  const eligible = preview.eligible === true;
+  setStatusLine(el("unclaimed-preview-verdict"), eligible
+    ? ["ok", "预览通过：服务端已重新读取权威到账记录，条件满足，可以进入最终确认。"]
+    : ["bad", "预览未通过：服务端重新校验后条件不满足，请勿提交。"]);
+
+  const errors = el("unclaimed-preview-errors");
+  if (errors) {
+    errors.replaceChildren();
+    const list = Array.isArray(preview.errors) ? preview.errors.filter((item) => item !== null && item !== undefined && String(item) !== "") : [];
+    if (list.length) {
+      for (const item of list) {
+        const li = document.createElement("li");
+        li.textContent = String(item);
+        errors.append(li);
+      }
+    } else if (!eligible) {
+      errors.append(emptyListItem("服务端未返回具体原因，请刷新详情或改用其它处理方式"));
+    } else {
+      errors.append(emptyListItem("没有问题项"));
+    }
+  }
+
+  const action = currentUnclaimedAction();
+  if (preview.action !== undefined && preview.action !== action) {
+    showUnclaimedError("处理方式已变化，请重新预览后再提交。");
+  }
+
+  renderPreviewFacts();
+  renderConfirmRows(reason);
+  updateUnclaimedSubmitState();
+}
+
+async function loadUnclaimed(epoch, options = {}) {
+  const query = new URLSearchParams();
+  if (unclaimed.fundId) query.set("fund_id", unclaimed.fundId);
+  if (unclaimed.status) query.set("status", unclaimed.status);
+  const suffix = query.toString();
+  try {
+    const data = await api(`/api/unclaimed${suffix ? `?${suffix}` : ""}`);
+    if (epoch !== sessionEpoch) return;
+    const rows = Array.isArray(data.unclaimed) ? data.unclaimed.filter((row) => row && typeof row === "object") : [];
+    unclaimed.rows = rows;
+    renderUnclaimedSummary(data);
+    renderUnclaimedList();
+    if (!unclaimed.selected) return;
+    if (unclaimedReviewActive() && options.force !== true) return;  // never clobber a live draft
+    await loadUnclaimedDetail(epoch, unclaimed.selected, {});
+  } catch (err) {
+    if (err && err.message === "unauthorized") return;
+    if (epoch !== sessionEpoch) return;
+    renderUnclaimedMessage(`未认领款加载失败：${err.message || err}`);
+  }
+}
+
+async function loadUnclaimedDetail(epoch, target, options = {}) {
+  if (!target) return;
+  try {
+    const data = await api(`/api/funds/${encodeURIComponent(target.fundId)}/unclaimed/${encodeURIComponent(target.id)}`);
+    if (epoch !== sessionEpoch) return;
+    if (!unclaimed.selected || unclaimed.selected.id !== target.id || unclaimed.selected.fundId !== target.fundId) return;
+    const record = data && typeof data.record === "object" && data.record ? data.record : data;
+    if (!record || typeof record !== "object") throw new Error("详情格式无效");
+
+    const previous = unclaimed.detail;
+    const previousVersion = previous ? unclaimedVersion(previous) : null;
+    unclaimed.detail = record;
+    if (previousVersion !== null && unclaimedVersion(record) !== previousVersion && unclaimed.preview) {
+      // Someone else moved the record while this operator was reviewing: the
+      // preview belongs to the old version and must be redone.
+      unclaimed.preview = null;
+      setUnclaimedNote("记录已被其他操作更新，原预览已失效：请重新核对并再次预览。");
+    }
+    renderUnclaimedDetail({ resetForm: options.resetForm === true });
+  } catch (err) {
+    if (err && err.message === "unauthorized") return;
+    if (epoch !== sessionEpoch) return;
+    if (!unclaimed.selected || unclaimed.selected.id !== target.id) return;
+    renderUnclaimedDetailMessage(`详情加载失败：${err.message || err}`);
+  }
+}
+
+function unclaimedInputSignature() {
+  const target = unclaimed.selected || {};
+  return JSON.stringify([target.fundId, target.id, currentUnclaimedAction(),
+    currentUnclaimedCandidate(), (el("unclaimed-reason")?.value || "").trim()]);
+}
+
+async function previewUnclaimed(event) {
+  if (event) event.preventDefault();
+  if (unclaimed.busy) return;
+  const target = unclaimed.selected;
+  if (!target || !unclaimed.detail) {
+    showUnclaimedError("请先在列表中选择一条未认领流水。");
+    return;
+  }
+  const action = currentUnclaimedAction();
+  const reasonNode = el("unclaimed-reason");
+  const reason = reasonNode ? reasonNode.value.trim() : "";
+  if (!reason) {
+    showUnclaimedError("处理理由必填：请写明核对依据（付款人、到账时间与订单的对应关系）。");
+    if (reasonNode) reasonNode.focus();
+    return;
+  }
+  if (reason.length > 500) {
+    showUnclaimedError("处理理由最多 500 字。");
+    return;
+  }
+  const subscriptionId = action === "link" ? currentUnclaimedCandidate() : "";
+  if (action === "link" && !subscriptionId) {
+    showUnclaimedError("关联处理必须先在上方的候选申购单中选中一单；没有合适候选时请改用原路退款或保持待核对。");
+    return;
+  }
+
+  clearUnclaimedError();
+  setUnclaimedNote("");
+  const epoch = sessionEpoch;
+  const signature = unclaimedInputSignature();
+  setUnclaimedBusy(true, "正在核对…");
+  try {
+    const body = { action };
+    if (action === "link") body.subscription_id = subscriptionId;
+    const data = await api(`/api/funds/${encodeURIComponent(target.fundId)}/unclaimed/${encodeURIComponent(target.id)}/preview`, {
+      method: "POST",
+      body,
+    });
+    if (epoch !== sessionEpoch) return;
+    if (!unclaimed.selected || unclaimed.selected.id !== target.id) return;
+    const preview = data && typeof data.preview === "object" && data.preview ? data.preview : {};
+    if (signature !== unclaimedInputSignature()) {
+      invalidateUnclaimedPreview("核对期间输入已改变，请重新预览。");
+      return;
+    }
+    unclaimed.preview = { preview, live: data.live === true, signature };
+    unclaimed.subscriptionId = subscriptionId;
+    restoreUnclaimedCandidateSelection();
+    renderUnclaimedPreview(reason);
+    if (data.live !== true) {
+      setUnclaimedNote("只读预览模式（live=false）：以下为校验结果，提交处理会被拒绝。");
+    }
+  } catch (err) {
+    if (err && err.message === "unauthorized") return;
+    if (epoch !== sessionEpoch) return;
+    unclaimed.preview = null;
+    renderUnclaimedPreview();
+    showUnclaimedError(`预览失败：${err.message || err}`);
+  } finally {
+    if (epoch === sessionEpoch) setUnclaimedBusy(false);
+  }
+}
+
+async function resolveUnclaimed() {
+  const previewState = unclaimed.preview;
+  const target = unclaimed.selected;
+  if (!previewState || !target || unclaimed.busy) return;
+  if (previewState.live !== true || previewState.preview.eligible !== true) return;
+  if (!el("unclaimed-confirm-check")?.checked || previewState.signature !== unclaimedInputSignature()) return;
+  const action = currentUnclaimedAction();
+  const reasonNode = el("unclaimed-reason");
+  const reason = reasonNode ? reasonNode.value.trim() : "";
+  if (!reason) {
+    showUnclaimedError("处理理由必填。");
+    return;
+  }
+  const previewRecord = previewState.preview.record && typeof previewState.preview.record === "object"
+    ? previewState.preview.record : null;
+  const version = unclaimedVersion(pick(previewRecord, "version") !== undefined ? previewRecord : unclaimed.detail);
+  const body = { action, version, reason };
+  if (action === "link") {
+    body.subscription_id = currentUnclaimedCandidate();
+    if (!body.subscription_id) {
+      showUnclaimedError("关联处理必须先选中候选申购单。");
+      return;
+    }
+  }
+
+  clearUnclaimedError();
+  const epoch = sessionEpoch;
+  setUnclaimedBusy(true, "正在提交…");
+  try {
+    const data = await api(`/api/funds/${encodeURIComponent(target.fundId)}/unclaimed/${encodeURIComponent(target.id)}/resolve`, {
+      method: "POST",
+      body,
+    });
+    if (epoch !== sessionEpoch) return;
+    const record = data && typeof data.record === "object" && data.record ? data.record : {};
+    const info = unclaimedStatusInfo(record);
+    flashNote(`处理已提交：${UNCLAIMED_ACTIONS[action] || action} · ${info.text}`, "ok");
+    unclaimed.preview = null;
+    unclaimed.subscriptionId = "";
+    unclaimed.detail = record && Object.keys(record).length ? record : null;
+    if (reasonNode) reasonNode.value = "";
+    const check = el("unclaimed-confirm-check");
+    if (check) check.checked = false;
+    setUnclaimedNote("");
+    renderUnclaimedPreview();
+    await refreshAll({ full: true });
+    if (epoch !== sessionEpoch) return;
+    await loadUnclaimed(epoch, { force: true });
+    await loadUnclaimedDetail(epoch, target, { resetForm: true });
+  } catch (err) {
+    if (err && err.message === "unauthorized") return;
+    if (epoch !== sessionEpoch) return;
+    const code = String((err && err.message) || err);
+    if (/version|stale|conflict/i.test(code)) {
+      showUnclaimedError(`提交被拒绝：该记录已被其他操作更新（${code}）。已重新加载详情，请重新核对后再提交；同一笔流水只会产生一个处理结果。`);
+      unclaimed.preview = null;
+      renderUnclaimedPreview();
+      await loadUnclaimed(epoch, { force: true });
+      await loadUnclaimedDetail(epoch, target, {});
+    } else if (/live/i.test(code)) {
+      showUnclaimedError(`提交被拒绝：当前 live=false 为只读预览模式（${code}）。未生成付款队列，也未改动任何账务。`);
+      unclaimed.preview = null;
+      renderUnclaimedPreview();
+    } else {
+      showUnclaimedError(`提交失败：${code}`);
+    }
+  } finally {
+    if (epoch === sessionEpoch) {
+      setUnclaimedBusy(false);
+      updateUnclaimedSubmitState();
+    }
+  }
+}
+
+function updateUnclaimedFundOptions(funds) {
+  const select = el("unclaimed-fund-filter");
+  if (!select) return;
+  const wanted = funds.map((fund) => [fund.fund_id || "", fund.label || fund.fund_id || ""]);
+  const current = Array.from(select.options).slice(1).map((option) => [option.value, option.textContent]);
+  if (JSON.stringify(wanted) === JSON.stringify(current)) return;  // keep the operator's choice
+  const previous = select.value;
+  select.replaceChildren();
+  const all = document.createElement("option");
+  all.value = "";
+  all.textContent = "全部基金";
+  select.append(all);
+  for (const [value, label] of wanted) {
+    const option = document.createElement("option");
+    option.value = value;
+    option.textContent = label;
+    select.append(option);
+  }
+  select.value = previous;
+  if (select.value !== previous) select.value = "";
+  unclaimed.fundId = select.value;
+}
+
 // ------------------------------------------------------------------ load
 
 function applyStatus(status, options = {}) {
@@ -859,6 +1890,7 @@ function applyStatus(status, options = {}) {
   updateBadges(status);
   renderFunds(funds, { full: options.full === true });
   updateFilterOptions(state.funds);
+  updateUnclaimedFundOptions(state.funds);
 }
 
 async function loadEvents(epoch) {
@@ -892,7 +1924,7 @@ async function loadOrders(epoch) {
 }
 
 async function loadPanels(epoch) {
-  await Promise.all([loadEvents(epoch), loadOrders(epoch)]);
+  await Promise.all([loadEvents(epoch), loadOrders(epoch), loadUnclaimed(epoch)]);
 }
 
 async function doRefresh(options = {}) {
@@ -973,6 +2005,46 @@ function wireStaticControls() {
     loadEvents(epoch);
     loadOrders(epoch);
   });
+
+  // ------------------------------------------------- unclaimed review wiring
+
+  el("unclaimed-refresh").addEventListener("click", () => loadUnclaimed(sessionEpoch, { force: true }));
+
+  el("unclaimed-fund-filter").addEventListener("change", () => {
+    unclaimed.fundId = el("unclaimed-fund-filter").value;
+    loadUnclaimed(sessionEpoch, { force: true });
+  });
+
+  el("unclaimed-status-filter").addEventListener("change", () => {
+    unclaimed.status = el("unclaimed-status-filter").value;
+    loadUnclaimed(sessionEpoch, { force: true });
+  });
+
+  el("unclaimed-close").addEventListener("click", closeUnclaimedDetail);
+  el("unclaimed-form").addEventListener("submit", previewUnclaimed);
+
+  el("unclaimed-form").addEventListener("change", (event) => {
+    if (event.target && event.target.name === "unclaimed-action") {
+      invalidateUnclaimedPreview("处理方式已切换，请重新预览后再提交。");
+      renderUnclaimedDetail();
+    }
+  });
+
+  //: The candidate radios are re-created on every detail render, so the choice
+  //: is tracked through event delegation instead of per-node listeners.
+  el("unclaimed-candidates").addEventListener("change", (event) => {
+    const input = event.target;
+    if (!input || input.name !== "unclaimed-candidate") return;
+    unclaimed.subscriptionId = input.checked ? input.value : "";
+    invalidateUnclaimedPreview("已重新选择候选申购单，请再次预览。");
+  });
+
+  el("unclaimed-reason").addEventListener("input", () => {
+    invalidateUnclaimedPreview("理由已修改：预览与最终确认已失效，请重新预览。");
+  });
+
+  el("unclaimed-confirm-check").addEventListener("change", updateUnclaimedSubmitState);
+  el("unclaimed-resolve-btn").addEventListener("click", resolveUnclaimed);
 
   el("backup-btn").addEventListener("click", async () => {
     const epoch = sessionEpoch;
