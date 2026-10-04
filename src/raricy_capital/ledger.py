@@ -268,9 +268,9 @@ def _next_period(period: str) -> str:
 
 
 def _period_window_ms(period: str) -> int:
-    """The 25th 18:00 (Beijing) application/payment deadline of a period."""
+    """The 7th 18:00 (Beijing) application/payment deadline of a period."""
     year, month = (int(part) for part in period.split('-'))
-    return int(datetime(year, month, 25, 18, tzinfo=BEIJING).timestamp() * 1000)
+    return int(datetime(year, month, 7, 18, tzinfo=BEIJING).timestamp() * 1000)
 
 
 def _cutoff_for_now(now_ms: int) -> tuple[str, int]:
@@ -280,19 +280,36 @@ def _cutoff_for_now(now_ms: int) -> tuple[str, int]:
     return _period_from_ms(cutoff_ms - 1), cutoff_ms
 
 
-def _ordinary_period(now_ms: int) -> tuple[str, int]:
-    """Subscription/redemption period for an application at ``now_ms``.
-
-    The window closes on the 25th at 18:00 Beijing time; later applications roll to
-    the next calendar month.
-    """
+def _period_for_deadline(now_ms: int, deadline_day: int) -> tuple[str, int]:
+    """Assign receipts/preferences to the current or next eligible month."""
     dt = datetime.fromtimestamp(now_ms / 1000, BEIJING)
-    deadline = dt.replace(day=25, hour=18, minute=0, second=0, microsecond=0)
+    deadline = dt.replace(day=deadline_day, hour=18, minute=0, second=0, microsecond=0)
     if dt <= deadline:
         return _period_from_ms(now_ms), int(deadline.timestamp() * 1000)
     nxt = _month_start(_month_start(dt) + timedelta(days=32))
-    next_deadline = nxt.replace(day=25, hour=18, minute=0, second=0, microsecond=0)
+    next_deadline = nxt.replace(day=deadline_day, hour=18, minute=0, second=0, microsecond=0)
     return f'{nxt.year:04d}-{nxt.month:02d}', int(next_deadline.timestamp() * 1000)
+
+
+def _ordinary_period(now_ms: int) -> tuple[str, int]:
+    """Receipts after the 7th 18:00 Beijing deadline belong to next month."""
+    return _period_for_deadline(now_ms, 7)
+
+
+def _require_application_window(now_ms: int) -> None:
+    if now_ms > _period_window_ms(_period_from_ms(now_ms)):
+        raise FundError('window_closed')
+
+
+def _subscription_due(sub: dict, period: str) -> bool:
+    """Honour recorded legacy terms while respecting an assigned future period."""
+    if sub.get('status') != 'received':
+        return False
+    occurred = int(sub.get('occurred_ms') or 0)
+    assigned = str(sub.get('period') or _period_from_ms(occurred))
+    window = _period_window_ms(period)
+    deadline = min(int(sub.get('deadline_ms') or window), _period_cutoff_ms(period))
+    return assigned <= period and occurred <= max(window, deadline)
 
 
 def _emergency_batch(now_ms: int) -> tuple[str, int, int]:
@@ -839,6 +856,7 @@ class FundLedger:
                 record = self.store.get(_SUBS, existing_id)
                 if record is not None:
                     return record
+            _require_application_window(now)
             fund = self._fund(fund_id)
             seq = self._next_seq(fund)
             sub_id = f'{fund_id}:{uuid.uuid4().hex[:12]}'
@@ -976,7 +994,7 @@ class FundLedger:
                              f'订单 {note} 超时到账，已按原路全额退款 {money_text(amount)} 小鱼干', now)
             else:
                 # Issuance follows the authoritative arrival time, not the discovery
-                # time.  A payment that arrives after this month's 25th 18:00
+                # time.  A payment that arrives after this month's 7th 18:00
                 # payment deadline is issued in the *next* period even though it
                 # arrived within the QR's 180-second validity.  Keep whichever is
                 # later -- the order's own period or the arrival period -- and give
@@ -1558,6 +1576,9 @@ class FundLedger:
                 if record is not None:
                     return record
 
+            if kind == 'ordinary':
+                _require_application_window(now)
+
             fund = self._fund(fund_id)
             nav, _ = self._require_nav(fund, now)
             holder = self._holder(fund_id, user_id)
@@ -1677,8 +1698,8 @@ class FundLedger:
                             now_ms=None) -> dict:
         """Record a holder's reinvestment preference for the next eligible period.
 
-        The choice window closes on the 25th at 18:00 Beijing time, the same
-        deadline as an ordinary application: a submission on or before it governs
+        The choice window closes on the 25th at 18:00 Beijing time, independently
+        of the ordinary application window: a submission on or before it governs
         the current month, and a later one only takes effect from the following
         month.  Each revision is stored together with the period it governs (and
         stays effective until the next eligible revision), so settling a named
@@ -1692,7 +1713,7 @@ class FundLedger:
         with self.store.transaction():
             fund = self._fund(fund_id)
             now = _as_ms(now_ms) if now_ms is not None else int(fund.get('updated_ms') or 0)
-            effective_period = _ordinary_period(now)[0]
+            effective_period = _period_for_deadline(now, 25)[0]
             key = f'{fund_id}:{user_id}'
             record = self.store.get('dividend_choices', key)
             if record is None:
@@ -1878,8 +1899,7 @@ class FundLedger:
             # are issued first; later arrivals roll to the next period
             issued_subs = []
             for sub_key, sub in self.store.list_items(_SUBS, f'{fund_id}:'):
-                if (sub['status'] == 'received'
-                        and (sub['occurred_ms'] or 0) <= window_ms):
+                if _subscription_due(sub, period):
                     shares = _shares_for(sub['principal_units'], exdiv_nav)
                     holder = self._holder(fund_id, sub['user_id'])
                     holder['shares_atoms'] += shares
@@ -1928,7 +1948,7 @@ class FundLedger:
                     req['shares_confirmed_atoms'] = req.get('shares_confirmed_atoms', 0)
                 if deferred:
                     # Remaining shares carry into the next period at the next NAV,
-                    # under *that* period's own 25th 18:00 application deadline, so
+                    # under *that* period's own 7th 18:00 application deadline, so
                     # the holder can still withdraw the unconfirmed remainder.
                     req['status'] = 'pending'
                     req['period'] = next_p
@@ -2092,7 +2112,7 @@ class FundLedger:
         window_ms = _period_window_ms(period)
         subs = [
             (sub_key, sub) for sub_key, sub in self.store.list_items(_SUBS, f'{fund_id}:')
-            if sub['status'] == 'received' and (sub['occurred_ms'] or 0) <= window_ms
+            if _subscription_due(sub, period)
         ]
         if not subs:
             record = self._period_record(fund_id, period, now, snapshot, {

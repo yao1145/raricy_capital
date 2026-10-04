@@ -231,7 +231,7 @@ def test_link_rejects_wrong_payer_amount_fund_and_settled_order(led):
 
 
 def test_link_refuses_an_issuance_period_whose_cutoff_already_passed(led):
-    when = ms(2026, 9, 10)
+    when = ms(2026, 9, 4)
     led.mark_account(F, 1000 * U, 0, when, when)
     led.seed(F, 'institution', 1000 * U, when)
     order = led.create_subscription(F, 'payer', 100 * U, 'sept', when)
@@ -562,7 +562,7 @@ def test_forged_authority_fields_are_not_accepted_by_the_domain(led):
 
 # ------------------------------------------------------------------ read-only
 def test_preview_and_detail_have_no_side_effects(led):
-    when = ms(2026, 9, 10)
+    when = ms(2026, 9, 4)
     led.mark_account(F, 1000 * U, 0, when, when)
     led.seed(F, 'institution', 1000 * U, when)
     order = led.create_subscription(F, 'payer', 100 * U, 'sept', when)

@@ -114,7 +114,7 @@ def test_post_cutoff_flow_cannot_distort_settlement(led):
     t0 = ms(2026, 1, 5)
     mark(led, 1000, t0)
     seed(led, 'inst', 1000, t0)
-    led.trade_realized(F, 't1', 100 * U, ms(2026, 1, 20))
+    led.trade_realized(F, 't1', 100 * U, ms(2026, 1, 6))
     mark(led, 1100, ms(2026, 1, 31, 23, 59, 55))
 
     # A new subscription arrives on Feb 1, after the Jan cutoff, before settlement.
@@ -138,7 +138,7 @@ def test_late_receipt_refunds_in_full_without_shares(led):
     t0 = ms(2026, 1, 5)
     mark(led, 1000, t0)
     seed(led, 'inst', 1000, t0)
-    tsub = ms(2026, 1, 10)
+    tsub = ms(2026, 1, 6)
     sub = led.create_subscription(F, 'u2', 100 * U, 's1', tsub)
     assert sub['total_units'] == 105 * U
     assert sub['expires_ms'] == tsub + 180_000
@@ -168,7 +168,7 @@ def test_timely_receipt_discovered_after_expiry_is_honoured(led):
     t0 = ms(2026, 1, 5)
     mark(led, 1000, t0)
     seed(led, 'inst', 1000, t0)
-    tsub = ms(2026, 1, 10)
+    tsub = ms(2026, 1, 6)
     sub = led.create_subscription(F, 'u2', 100 * U, 's2', tsub)
 
     # The local scanner only notices the payment well after the 180s TTL.
@@ -184,7 +184,7 @@ def test_settlement_issues_external_shares_exactly_once(led):
     t0 = ms(2026, 1, 5)
     mark(led, 1000, t0)
     seed(led, 'inst', 1000, t0)
-    tsub = ms(2026, 1, 10)
+    tsub = ms(2026, 1, 6)
     sub = led.create_subscription(F, 'u2', 1000 * U, 's3', tsub)
     led.receive_transfer(F, {
         'transfer_id': 'tx3', 'from_user_id': 'u2', 'amount_units': 1050 * U,
@@ -210,7 +210,7 @@ def test_receipt_dedup_and_trade_replay(led):
     t0 = ms(2026, 1, 5)
     mark(led, 1000, t0)
     seed(led, 'inst', 1000, t0)
-    tsub = ms(2026, 1, 10)
+    tsub = ms(2026, 1, 6)
     s1 = led.create_subscription(F, 'u2', 100 * U, 'dup', tsub)
     s2 = led.create_subscription(F, 'u2', 100 * U, 'dup', tsub + 5000)
     assert s1['id'] == s2['id']
@@ -233,13 +233,13 @@ def test_ordinary_redemption_20pct_gate_and_double_reservation(led):
     t0 = ms(2026, 1, 5)
     mark(led, 1000, t0)
     seed(led, 'inst', 1000, t0)
-    mark(led, 1000, ms(2026, 1, 10))
-    req = led.request_redemption(F, 'inst', 500 * U, 'ordinary', 'r1', ms(2026, 1, 10))
+    mark(led, 1000, ms(2026, 1, 6))
+    req = led.request_redemption(F, 'inst', 500 * U, 'ordinary', 'r1', ms(2026, 1, 6))
     assert req['shares_reserved_atoms'] == 500 * ATOMS
 
     # Cannot reserve the same shares again (1000 held, 500 already reserved).
     with pytest.raises(FundError) as exc:
-        led.request_redemption(F, 'inst', 600 * U, 'ordinary', 'r2', ms(2026, 1, 10))
+        led.request_redemption(F, 'inst', 600 * U, 'ordinary', 'r2', ms(2026, 1, 6))
     assert exc.value.code == 'insufficient_shares'
 
     mark(led, 1000, ms(2026, 1, 31, 23, 59, 55))
@@ -330,7 +330,7 @@ def test_nav_excludes_liabilities_pending_and_fees(led):
     assert led.status(F)['nav'] == '1.00000000'
 
     # A pending receipt and its institution fee sit in the wallet but not the fund.
-    tsub = ms(2026, 1, 10)
+    tsub = ms(2026, 1, 6)
     sub = led.create_subscription(F, 'u2', 100 * U, 's9', tsub)
     led.receive_transfer(F, {
         'transfer_id': 'tx9', 'from_user_id': 'u2', 'amount_units': 105 * U,
@@ -369,7 +369,7 @@ def test_seed_repeat_cannot_remint_already_allocated_cash(led):
 
 
 def test_shareless_fund_issues_first_subscription_at_nav_one(led):
-    t = ms(2026, 1, 10)
+    t = ms(2026, 1, 6)
     sub = led.create_subscription(F, 'u2', 100 * U, 'first', t)
     led.receive_transfer(F, {
         'transfer_id': 'first-tx', 'from_user_id': 'u2', 'amount_units': 105 * U,
@@ -526,7 +526,7 @@ def test_cancel_received_subscription_refunds_principal_and_fee(led):
     t0 = ms(2026, 1, 5)
     mark(led, 1000, t0)
     seed(led, 'inst', 1000, t0)
-    tsub = ms(2026, 1, 10)
+    tsub = ms(2026, 1, 6)
     sub = led.create_subscription(F, 'u2', 100 * U, 'cancelsub', tsub)
     led.receive_transfer(F, {
         'transfer_id': 'tx-cancel', 'from_user_id': 'u2', 'amount_units': 105 * U,
@@ -550,7 +550,7 @@ def test_cancel_redemption_releases_reserved_shares(led):
     t0 = ms(2026, 1, 5)
     mark(led, 1000, t0)
     seed(led, 'inst', 1000, t0)
-    t = ms(2026, 1, 10)
+    t = ms(2026, 1, 6)
     mark(led, 1000, t)
     req = led.request_redemption(F, 'inst', 500 * U, 'ordinary', 'cancelred', t)
 
@@ -566,7 +566,7 @@ def test_cancel_refuses_crossed_deadline_and_settled_orders(led):
     t0 = ms(2026, 1, 5)
     mark(led, 1000, t0)
     seed(led, 'inst', 1000, t0)
-    t = ms(2026, 1, 10)
+    t = ms(2026, 1, 6)
     mark(led, 1000, t)
 
     req = led.request_redemption(F, 'inst', 500 * U, 'ordinary', 'latecancel', t)
@@ -727,8 +727,8 @@ def test_carried_ordinary_remainder_gets_next_deadline_and_cancel_keeps_confirme
     t0 = ms(2026, 1, 5)
     mark(led, 1000, t0)
     seed(led, 'inst', 1000, t0)
-    mark(led, 1000, ms(2026, 1, 20))
-    req = led.request_redemption(F, 'inst', 1000 * U, 'ordinary', 'carry1', ms(2026, 1, 20))
+    mark(led, 1000, ms(2026, 1, 6))
+    req = led.request_redemption(F, 'inst', 1000 * U, 'ordinary', 'carry1', ms(2026, 1, 6))
 
     mark(led, 1000, ms(2026, 1, 31, 23, 59, 55))
     r = led.settle_month(F, '2026-01', ms(2026, 2, 2))
@@ -739,14 +739,14 @@ def test_carried_ordinary_remainder_gets_next_deadline_and_cancel_keeps_confirme
     assert carried['shares_confirmed_atoms'] == 200 * ATOMS
     assert carried['shares_reserved_atoms'] == 800 * ATOMS
     # §6.4 lets the deferred part be withdrawn: it carries the next period's own
-    # 25th 18:00 deadline, with period and batch kept consistent.
+    # 7th 18:00 deadline, with period and batch kept consistent.
     assert carried['period'] == '2026-02'
     assert carried['batch'] == '2026-02'
-    assert carried['deadline_ms'] == ms(2026, 2, 25, 18)
+    assert carried['deadline_ms'] == ms(2026, 2, 7, 18)
     payout = led.pending_payouts(F)[0]
     assert payout['kind'] == 'redemption' and payout['amount_units'] == 200 * U
 
-    out = led.cancel_order(F, 'inst', req['id'], ms(2026, 2, 10))
+    out = led.cancel_order(F, 'inst', req['id'], ms(2026, 2, 6))
     assert out['status'] == 'cancelled'
     holder = led.holder(F, 'inst')
     assert holder['reserved_atoms'] == 0                 # only the 800 remainder released
@@ -763,14 +763,14 @@ def test_subscription_paid_just_after_window_rolls_period_and_stays_cancellable(
     t0 = ms(2026, 1, 5)
     mark(led, 1000, t0)
     seed(led, 'inst', 1000, t0)
-    created = ms(2026, 1, 25, 17, 59, 30)
+    created = ms(2026, 1, 7, 17, 59, 30)
     sub = led.create_subscription(F, 'u2', 100 * U, 'rollsub', created)
     assert sub['period'] == '2026-01'
-    assert sub['deadline_ms'] == ms(2026, 1, 25, 18)
+    assert sub['deadline_ms'] == ms(2026, 1, 7, 18)
 
-    occurred = ms(2026, 1, 25, 18, 0, 30)
+    occurred = ms(2026, 1, 7, 18, 0, 30)
     assert occurred - created < 180_000                 # still within QR validity
-    discovered = ms(2026, 1, 26, 10)                    # scanner notices it next day
+    discovered = ms(2026, 1, 8, 10)                    # scanner notices it next day
     r = led.receive_transfer(F, {
         'transfer_id': 'roll-tx', 'from_user_id': 'u2', 'amount_units': 105 * U,
         'note': sub['payment_note'], 'occurred_ms': occurred,
@@ -779,7 +779,7 @@ def test_subscription_paid_just_after_window_rolls_period_and_stays_cancellable(
     stored = led.store.get('subscriptions', sub['id'])
     assert stored['occurred_ms'] == occurred            # authority is arrival time
     assert stored['period'] == '2026-02'                # issuance rolls forward
-    assert stored['deadline_ms'] == ms(2026, 2, 25, 18)
+    assert stored['deadline_ms'] == ms(2026, 2, 7, 18)
 
     rollover = [n for n in led.notices() if n['id'].startswith('sub-rollover:')]
     assert len(rollover) == 1
@@ -792,7 +792,7 @@ def test_subscription_paid_just_after_window_rolls_period_and_stays_cancellable(
 
     mark(led, 1105, discovered + 5000)
     assert led.status(F)['pending_receipts_units'] == 100 * U
-    out = led.cancel_order(F, 'u2', sub['id'], ms(2026, 1, 26, 12))
+    out = led.cancel_order(F, 'u2', sub['id'], ms(2026, 1, 8, 12))
     assert out['status'] == 'cancelled'
     st = led.status(F)
     assert st['pending_receipts_units'] == 0
@@ -834,8 +834,8 @@ def test_cash_short_redemption_scaling_notice_stable_and_amount_unchanged(led):
     t0 = ms(2026, 1, 5)
     mark(led, 1000, t0)
     seed(led, 'inst', 1000, t0)
-    led.mark_account(F, 100 * U, 900 * U, ms(2026, 1, 10), ms(2026, 1, 10))
-    req = led.request_redemption(F, 'inst', 500 * U, 'ordinary', 'cs-red', ms(2026, 1, 10))
+    led.mark_account(F, 100 * U, 900 * U, ms(2026, 1, 6), ms(2026, 1, 6))
+    req = led.request_redemption(F, 'inst', 500 * U, 'ordinary', 'cs-red', ms(2026, 1, 6))
     led.mark_account(F, 100 * U, 900 * U, ms(2026, 1, 31, 23, 59, 55),
                      ms(2026, 1, 31, 23, 59, 55))
 
@@ -848,7 +848,7 @@ def test_cash_short_redemption_scaling_notice_stable_and_amount_unchanged(led):
     assert carried['shares_confirmed_atoms'] == 100 * ATOMS
     assert carried['shares_reserved_atoms'] == 400 * ATOMS
     assert carried['period'] == '2026-02' and carried['batch'] == '2026-02'
-    assert carried['deadline_ms'] == ms(2026, 2, 25, 18)
+    assert carried['deadline_ms'] == ms(2026, 2, 7, 18)
 
     key = f'settle-redeem-short:{F}:2026-01:{req["id"]}'
     msgs = [n for n in led.notices() if n['id'] == key]
@@ -867,8 +867,8 @@ def test_cash_short_redemption_notice_carries_period_across_months(led):
     t0 = ms(2026, 1, 5)
     mark(led, 1000, t0)
     seed(led, 'inst', 1000, t0)
-    led.mark_account(F, 100 * U, 900 * U, ms(2026, 1, 10), ms(2026, 1, 10))
-    req = led.request_redemption(F, 'inst', 500 * U, 'ordinary', 'cs-multi', ms(2026, 1, 10))
+    led.mark_account(F, 100 * U, 900 * U, ms(2026, 1, 6), ms(2026, 1, 6))
+    req = led.request_redemption(F, 'inst', 500 * U, 'ordinary', 'cs-multi', ms(2026, 1, 6))
     led.mark_account(F, 100 * U, 900 * U, ms(2026, 1, 31, 23, 59, 55),
                      ms(2026, 1, 31, 23, 59, 55))
 
@@ -954,8 +954,8 @@ def test_cancel_unexecuted_ordinary_redemption_when_period_pending_valuation(led
     t0 = ms(2026, 1, 5)
     mark(led, 1000, t0)
     seed(led, 'inst', 1000, t0)
-    led.mark_account(F, 1000 * U, 0, ms(2026, 1, 10), ms(2026, 1, 10))
-    req = led.request_redemption(F, 'inst', 500 * U, 'ordinary', 'pv-red', ms(2026, 1, 10))
+    led.mark_account(F, 1000 * U, 0, ms(2026, 1, 6), ms(2026, 1, 6))
+    req = led.request_redemption(F, 'inst', 500 * U, 'ordinary', 'pv-red', ms(2026, 1, 6))
 
     # No genuinely pre-cutoff month-end quote: January stays unpriceable.
     pending = led.settle_month(F, '2026-01', ms(2026, 2, 2))
@@ -963,7 +963,7 @@ def test_cancel_unexecuted_ordinary_redemption_when_period_pending_valuation(led
     assert pending['reason'] == 'stale_valuation'
     assert led.pending_payouts(F) == []
 
-    # The 25th deadline is long past, but nothing executed: the unexecuted
+    # The 7th deadline is long past, but nothing executed: the unexecuted
     # reservation must still be reclaimable.
     out = led.cancel_order(F, 'inst', req['id'], ms(2026, 2, 10))
     assert out['status'] == 'cancelled'
@@ -981,8 +981,8 @@ def test_pending_valuation_cancel_keeps_confirmed_shares_and_past_payout(led):
     t0 = ms(2026, 1, 5)
     mark(led, 1000, t0)
     seed(led, 'inst', 1000, t0)
-    led.mark_account(F, 100 * U, 900 * U, ms(2026, 1, 10), ms(2026, 1, 10))
-    req = led.request_redemption(F, 'inst', 500 * U, 'ordinary', 'pv-carry', ms(2026, 1, 10))
+    led.mark_account(F, 100 * U, 900 * U, ms(2026, 1, 6), ms(2026, 1, 6))
+    req = led.request_redemption(F, 'inst', 500 * U, 'ordinary', 'pv-carry', ms(2026, 1, 6))
     led.mark_account(F, 100 * U, 900 * U, ms(2026, 1, 31, 23, 59, 55),
                      ms(2026, 1, 31, 23, 59, 55))
 
@@ -1010,7 +1010,7 @@ def test_received_subscription_refunded_once_while_period_pending_valuation(led)
     t0 = ms(2026, 1, 5)
     mark(led, 1000, t0)
     seed(led, 'inst', 1000, t0)
-    tsub = ms(2026, 1, 10)
+    tsub = ms(2026, 1, 6)
     sub = led.create_subscription(F, 'u2', 100 * U, 'pv-sub', tsub)
     received = led.receive_transfer(F, {
         'transfer_id': 'pv-sub-tx', 'from_user_id': 'u2', 'amount_units': 105 * U,
@@ -1023,7 +1023,7 @@ def test_received_subscription_refunded_once_while_period_pending_valuation(led)
     assert pending['status'] == 'pending_valuation'
 
     # Paid but unissued, and its month cannot be priced: refund principal + fee
-    # in full even though the 25th 18:00 window has long closed.
+    # in full even though the 7th 18:00 window has long closed.
     out = led.cancel_order(F, 'u2', sub['id'], ms(2026, 2, 10))
     assert out['status'] == 'cancelled'
     st = led.status(F)

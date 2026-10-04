@@ -72,7 +72,7 @@ def test_control_order_is_matched_without_expiry_refund(ledger):
     assert not ledger.store.list('payouts')
 
 def test_control_capital_after_monthly_window_rolls_forward(ledger):
-    _,_,receipt=incoming(ledger,C,100,note='本金',when=ms(10,26))
+    _,_,receipt=incoming(ledger,C,100,note='本金',when=ms(10,8))
     assert ledger.store.get('subscriptions',receipt['subscription_id'])['period']=='2026-11'
     settle(ledger)
     assert ledger.status(F)['pending_receipts_units']==100*U
