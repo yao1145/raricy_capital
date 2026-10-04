@@ -147,6 +147,7 @@ README 不声称已完成部署。运维侧请读 [DEPLOYMENT.md](docs/DEPLOYMEN
 | [INTRODUCTION.md](docs/INTRODUCTION.md) | 研究/评审 | 两只策略的研究口径、历史图表与压力情形分析 |
 | [AGENTS.md](AGENTS.md) | 一切自动化协作方 | 工作约定：偏好、文件所有权、最小改动与不可逾越的资金安全红线 |
 | [CLAUDE.md](CLAUDE.md) | Claude Code | 上述通用约定 + 本仓库的具体工作流 |
+| [推广文案](promotion/推广文案.md) | 网站用户 | 两条基金的简洁图文介绍，含历史回测收益、回撤和口径 |
 | [docs/research/](docs/research/) | 研究/评审 | 研究原始材料与图表来源说明；配图在 `docs/assets/` |
 
 ---
