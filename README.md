@@ -71,6 +71,7 @@
 | 模块 | 职责 | 关键契约 |
 | --- | --- | --- |
 | `src/raricy_capital/__main__.py` | 独立入口：解析参数、取数据锁、装配配置、起服务或停机备份 | `--config / --data-dir / --port / --live / --backup` |
+| `bootstrap_logging.py` | 启动失败日志：缺依赖、配置错误、锁冲突与服务启动异常 | 标准库独立记录，脱敏 JSONL，1 MiB 加 3 份轮转 |
 | `config.py` | `FundConfig` 加载与校验；`CredentialVault`（Fernet）读写站点凭据 | 非回环 host、越界端口、未知字段一律拒绝启动 |
 | `contracts.py` | 金额/份额精度、`FundError` 稳定错误码、北京时间、冻结的 `FundPolicy` / `POLICIES` | `money_units()` / `money_text()` / `now_ms()` |
 | `store.py` | SQLite 单写者存储：`records` 键值命名空间、`audit_events`、事务上下文 | `transaction()` / `get/put/claim` / `backup()` |
@@ -176,7 +177,8 @@ README 不声称已完成部署。运维侧请读 [DEPLOYMENT.md](docs/DEPLOYMEN
 
 ## 6. 本机验证记录
 
-2026-10-04，在本项目独立 `.venv` 中运行 `tests/`，**164 项通过**。
+2026-10-04，在本项目独立 `.venv` 中运行 `tests/`，**190 项通过**。
 独立 wheel 构建成功并包含运营台静态资源；入口和 Linux 安装脚本语法检查通过。
+本轮补充启动登录重试、积压月份按序结算、挂起申请撤回与通知金额单位修正。
 空账户预览验证了鉴权、请求来源保护、循环心跳及在线备份，外部写操作保持关闭。
 真实账户收付、交易和 Linux 服务部署仍待目标环境验收，详见 [部署指南](docs/DEPLOYMENT.md)。

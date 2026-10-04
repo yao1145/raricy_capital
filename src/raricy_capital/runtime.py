@@ -3,21 +3,83 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import math
 import os
+import re
 import time
 from datetime import datetime, timedelta
 
-from .client import FundSiteClient
+from .client import FundSiteClient, FundSiteError
 from .adapters import TradingClientAdapter
 from .commands import CommandHandler
 from .config import CredentialVault, FundConfig
 from .contracts import BEIJING, FundError, POLICIES, money_units, now_ms
-from .ledger import FundLedger
+from .ledger import FundLedger, _period_cutoff_ms
 from .operations import ServiceOperations
 from .payments import PaymentsWorker
 from .store import FundStore
 from .trader import FundTrader
 from .site_protocol import site_time_ms
+
+#: Account-login retry schedule for a configured-but-unreachable fund.  The
+#: target list lives in memory only and is never written to disk: a restart
+#: rebuilds it from the vault and env, exactly like any other session state.
+LOGIN_RETRY_BASE_MS = 10_000
+LOGIN_RETRY_MAX_MS = 60_000
+LOGIN_RETRY_AFTER_CAP_MS = 3_600_000
+
+#: Login failures that must never be hammered automatically.  A wrong password,
+#: a mismatched identity or a fund account clash is an operator problem; retrying
+#: cannot fix it and could lock the account or cross identities.
+PERMANENT_LOGIN_CODES = frozenset({
+    'unauthorized', 'identity_mismatch', 'fund_accounts_must_differ',
+    'account_identity_changed', 'credentials_required', 'invalid_base_url',
+})
+
+_PERIOD_RE = re.compile(r'\d{4}-\d{2}\Z')
+
+
+def _login_retry_delay_ms(attempts: int, retry_after: float | None) -> int:
+    """Backoff for the ``attempts``-th failed login, honouring a 429 header.
+
+    Exponential from 10s, capped at 60s.  A finite, non-negative ``Retry-After``
+    raises the wait to whatever the server asked for (bounded to one hour) so a
+    rate limit is respected instead of hammered.
+    """
+    try:
+        count = max(1, int(attempts))
+    except (TypeError, ValueError):
+        count = 1
+    delay = min(LOGIN_RETRY_MAX_MS, LOGIN_RETRY_BASE_MS * (2 ** (count - 1)))
+    if (isinstance(retry_after, (int, float)) and not isinstance(retry_after, bool)
+            and math.isfinite(retry_after) and retry_after >= 0):
+        delay = max(delay, min(LOGIN_RETRY_AFTER_CAP_MS, int(retry_after * 1000)))
+    return delay
+
+
+def _login_failure_is_permanent(exc: BaseException) -> bool:
+    """Permanent failures must not be retried; transient ones should."""
+    code = getattr(exc, 'code', None)
+    if code in PERMANENT_LOGIN_CODES:
+        return True
+    if isinstance(exc, FundSiteError):
+        if getattr(exc, 'retryable', False):
+            return False
+        status = getattr(exc, 'status', 0) or 0
+        # A 4xx that is not explicitly retryable is a rejection, not a blip.
+        return 400 <= status < 500
+    return False
+
+
+def _is_past_period(period: object, stamp: int) -> bool:
+    """True for a well-formed ``YYYY-MM`` whose month end has already passed."""
+    if not isinstance(period, str) or _PERIOD_RE.match(period) is None:
+        return False
+    try:
+        cutoff = _period_cutoff_ms(period)
+    except FundError:
+        return False
+    return cutoff <= stamp
 
 
 class FundService:
@@ -38,6 +100,10 @@ class FundService:
         self._task: asyncio.Task | None = None
         self._closed = False
         self._last_backup = 0.0
+        # Configured accounts that failed their last login, keyed by fund id.
+        # Memory only: credentials are what the vault/env already gave us, and a
+        # restart re-reads them from there rather than any new on-disk format.
+        self._login_retry: dict[str, dict] = {}
 
     def _fund(self, fund_id: str) -> None:
         if fund_id not in POLICIES:
@@ -72,6 +138,7 @@ class FundService:
             if old:
                 await old.close()
             self.store.append_event('account.logged_in', fund_id=fund_id)
+            self._clear_login_retry(fund_id, now_ms())
             return {'fund_id': fund_id, 'user_id': stable_id, 'logged_in': True}
         except BaseException:
             if self.clients.get(fund_id) is not client:
@@ -93,12 +160,110 @@ class FundService:
             if username and password and not username.startswith('changeme'):
                 credentials[fund_id] = {'username': username, 'password': password}
         for fund_id, value in credentials.items():
-            try:
-                await self._login(fund_id, value['username'], value['password'], persist=False)
-            except Exception as exc:
-                self.operations.record_event('account.restore_failed', fund_id=fund_id, error=exc)
+            target = {
+                'username': value['username'],
+                'password': value['password'],
+                'attempts': 0,
+                'next_ms': self.started_ms,
+                'permanent': False,
+                'code': None,
+                'first_ms': self.started_ms,
+                'notified': False,
+            }
+            self._login_retry[fund_id] = target
+            await self._attempt_restore(fund_id, target, self.started_ms)
         self._task = asyncio.create_task(self._loop(), name='capital-funds-service')
         self.operations.record_event('service.started', details={'live': self.config.live})
+
+    async def _attempt_restore(self, fund_id: str, target: dict, stamp: int) -> None:
+        """Try one configured account; a success clears the retry target."""
+        try:
+            await self._login(fund_id, target['username'], target['password'], persist=False)
+        except Exception as exc:  # noqa: BLE001 - classified into a stable code
+            self._record_login_failure(fund_id, target, exc, stamp)
+
+    def _record_login_failure(self, fund_id: str, target: dict, exc: BaseException,
+                              stamp: int) -> None:
+        code = getattr(exc, 'code', None) or type(exc).__name__
+        permanent = _login_failure_is_permanent(exc)
+        target['attempts'] = int(target.get('attempts', 0)) + 1
+        target['code'] = code
+        target['permanent'] = permanent
+        target['failed_ms'] = stamp
+        if permanent:
+            target['next_ms'] = None  # never hammer a wrong password or wrong identity
+        else:
+            target['next_ms'] = stamp + _login_retry_delay_ms(
+                target['attempts'], getattr(exc, 'retry_after', None))
+        self._login_retry[fund_id] = target
+        # One durable notice per failure episode; every actual attempt still gets
+        # its own rate-limited event so the log tracks attempts, not ticks.
+        if not target.get('notified'):
+            target['notified'] = True
+            self.payments.enqueue_notice(
+                fund_id,
+                f'{fund_id} 账号连接失败（{"需要人工重新登录" if permanent else "将自动重试"}）。',
+                event_id=f'login-failed:{fund_id}:{target["first_ms"]}',
+                kind='account_login', now_ms=stamp)
+        self.operations.record_event(
+            'account.login_failed', fund_id=fund_id, level='warning',
+            details={'code': code, 'permanent': permanent, 'attempts': target['attempts']},
+            event_key=f'account.login_failed:{fund_id}:{target["first_ms"]}:{target["attempts"]}',
+            created_ms=stamp)
+
+    def _clear_login_retry(self, fund_id: str, stamp: int) -> None:
+        record = self._login_retry.pop(fund_id, None)
+        if record is None or int(record.get('attempts', 0)) <= 0:
+            return  # a first-time login has no failure to announce recovery from
+        self.payments.enqueue_notice(
+            fund_id, '账号连接已恢复，服务将继续核对账户与持仓。',
+            event_id=f'login-recovered:{fund_id}:{record.get("first_ms")}',
+            kind='account_login', now_ms=stamp)
+
+    async def _retry_pending_logins(self, stamp: int) -> None:
+        """Retry configured accounts whose backoff has elapsed.
+
+        Runs under the service mutex; it never sleeps here, it only compares each
+        target's own next-deadline against ``stamp`` so a slow retry cannot delay
+        the loop and one fund's failure cannot crowd out the other's schedule.
+        """
+        for fund_id in list(self._login_retry):
+            target = self._login_retry[fund_id]
+            if fund_id in self.clients:
+                self._login_retry.pop(fund_id, None)
+                continue
+            if target.get('permanent'):
+                continue
+            next_ms = target.get('next_ms')
+            if next_ms is None or stamp < int(next_ms):
+                continue
+            await self._attempt_restore(fund_id, target, stamp)
+
+    def _reflect_login_health(self, stamp: int) -> None:
+        """Keep health degraded while a configured account cannot log in.
+
+        No target and no client means nothing was configured: health is left
+        untouched rather than reported healthy off a probe that never ran.
+        """
+        if not self._login_retry:
+            self.last_tick_error = None
+            return
+        record = next(iter(self._login_retry.values()))
+        code = record.get('code') or 'account_login_failed'
+        self.last_tick_error = code
+        self.operations.health_tick(stamp, False, error=code)
+
+    def _settlement_view(self, fund_id: str) -> dict:
+        hold = self.store.get('valuation_holds', fund_id, {}) or {}
+        pending = []
+        for _, record in self.store.list_items('periods', f'{fund_id}:'):
+            if record.get('status') == 'settled':
+                continue
+            pending.append({'period': record.get('period'), 'status': record.get('status'),
+                            'reason': record.get('reason')})
+        pending.sort(key=lambda row: row.get('period') or '')
+        return {'hold': bool(hold.get('hold')), 'period': hold.get('period'),
+                'reason': hold.get('reason'), 'pending': pending}
 
     async def _private_messages(self, stamp: int) -> None:
         for fund_id, client in tuple(self.clients.items()):
@@ -117,29 +282,85 @@ class FundService:
                 if messages:
                     self.store.put('command_cursors', key, max(m.id for m in messages))
 
+    def _settlement_periods(self, fund_id: str, prev_month: str, stamp: int) -> list[str]:
+        """Every month this fund still owes a settlement for, oldest first.
+
+        Sources: explicit unfinished period records, still-pending ordinary
+        redemptions, received-but-unissued subscriptions that are actually past
+        their month end, and the immediately previous month.  Malformed or future
+        ``YYYY-MM`` strings are ignored rather than allowed to jam the queue.
+        """
+        periods: set[str] = set()
+        for _, record in self.store.list_items('periods', f'{fund_id}:'):
+            period = record.get('period')
+            if record.get('status') != 'settled' and _is_past_period(period, stamp):
+                periods.add(period)
+        for order in self.ledger.orders(fund_id):
+            period = order.get('period')
+            if order.get('order_type') == 'redemption':
+                if order.get('kind') == 'ordinary' and order.get('status') == 'pending' \
+                        and _is_past_period(period, stamp):
+                    periods.add(period)
+            elif order.get('order_type') == 'subscription':
+                if order.get('status') == 'received' and _is_past_period(period, stamp):
+                    periods.add(period)
+        if _is_past_period(prev_month, stamp):
+            periods.add(prev_month)
+        return sorted(periods)
+
+    def _settle_months(self, fund_id: str, prev_month: str, stamp: int) -> None:
+        """Settle a fund's outstanding months in chronological order.
+
+        An older month stuck in ``pending_valuation`` blocks newer months: the
+        earlier batch must be resolved (from its own frozen cutoff book) before a
+        later one is attempted, so a newer settlement can never paper over an
+        older unresolved valuation.
+        """
+        blocked = False
+        for period in self._settlement_periods(fund_id, prev_month, stamp):
+            key = f'{fund_id}:month:{period}'
+            existing = self.store.get('runtime_settlements', key)
+            if isinstance(existing, dict) and (existing.get('result') or {}).get('status') == 'settled':
+                continue  # only a true settled batch is deduplicated
+            try:
+                result = self.ledger.settle_month(fund_id, period, stamp)
+            except FundError as exc:
+                self.store.append_event(
+                    'settlement.deferred', fund_id=fund_id, level='warning',
+                    details={'period': period, 'reason': exc.code},
+                    event_key=f'settlement:{fund_id}:month:{period}:{exc.code}')
+                blocked = True
+                break
+            if result.get('status') == 'settled':
+                self.store.put('runtime_settlements', key, {'result': result, 'completed_ms': stamp})
+                continue
+            self.store.put('valuation_holds', fund_id,
+                           {'hold': True, 'period': period, 'reason': result.get('reason')})
+            blocked = True
+            break
+        if not blocked:
+            hold = self.store.get('valuation_holds', fund_id, {}) or {}
+            if hold.get('hold'):
+                # No unresolved month remains; a later settled month may now clear
+                # the hold, but never an earlier one still waiting.
+                self.store.put('valuation_holds', fund_id, {'hold': False})
+
     async def _settlements(self, stamp: int) -> None:
         if not self.config.live:
             return
         local = datetime.fromtimestamp(stamp / 1000, BEIJING)
-        last_month = (local.replace(day=1) - timedelta(days=1)).strftime('%Y-%m')
+        prev_month = (local.replace(day=1) - timedelta(days=1)).strftime('%Y-%m')
         for fund_id in tuple(self.clients):
             trade = self.trader.public_status()['funds'][fund_id]
             if trade['blocked'] or trade['pending'] or trade['mark_failed']:
                 continue
-            for kind, period in (('month', last_month), ('emergency', local.strftime('%Y-%m-%d'))):
-                if kind == 'emergency' and local.hour < 20:
-                    continue
-                key = f'{fund_id}:{kind}:{period}'
-                if kind == 'month' and self.store.get('runtime_settlements', key):
-                    continue
+            self._settle_months(fund_id, prev_month, stamp)
+            # An emergency batch prices off its own frozen 20:00 book, so an
+            # unresolved ordinary month must not block an otherwise eligible exit.
+            if local.hour >= 20:
+                key = f'{fund_id}:emergency:{local.strftime("%Y-%m-%d")}'
                 try:
-                    result = (self.ledger.settle_month(fund_id, period, stamp) if kind == 'month'
-                              else self.ledger.settle_emergency(fund_id, stamp))
-                    if kind == 'month' and result.get('status') == 'settled':
-                        self.store.put('runtime_settlements', key, {'result': result, 'completed_ms': stamp})
-                        self.store.put('valuation_holds', fund_id, {'hold': False})
-                    elif kind == 'month':
-                        self.store.put('valuation_holds', fund_id, {'hold': True, 'period': period, 'reason': result.get('reason')})
+                    self.ledger.settle_emergency(fund_id, stamp)
                 except FundError as exc:
                     event_key = f'settlement:{key}:{exc.code}'
                     self.store.append_event('settlement.deferred', fund_id=fund_id, level='warning',
@@ -172,9 +393,17 @@ class FundService:
     async def tick(self) -> None:
         async with self.mutex:
             stamp = now_ms()
+            try:
+                await self._retry_pending_logins(stamp)
+            except Exception as exc:  # a retry bookkeeping failure must not kill the loop
+                self.last_tick_error = getattr(exc, 'code', type(exc).__name__)
+                self.operations.record_event('account.retry_failed', error=exc)
             if not self.clients:
                 self.last_tick_ms = stamp
                 self.store.put('service', 'heartbeat', {'active': True, 'last_tick_ms': stamp})
+                # A degraded configured account must not be forgotten just because
+                # there is no client to run workers for yet.
+                self._reflect_login_health(stamp)
                 return
             try:
                 private_error = None
@@ -201,8 +430,13 @@ class FundService:
                     if value['shares_atoms'] and value['quote_ms']:
                         self.store.put('nav_history', f'{fund_id}:{value["updated_ms"] // 3600000:012d}',
                                        {'updated_ms': value['updated_ms'], 'nav': value['nav'], 'equity_units': value['equity_units']})
-                self.operations.health_tick(stamp, True)
-                self.last_tick_error = None
+                if self._login_retry:
+                    # Some client is up but a configured fund is still not: health
+                    # stays degraded while the other fund keeps working normally.
+                    self._reflect_login_health(stamp)
+                else:
+                    self.last_tick_error = None
+                    self.operations.health_tick(stamp, True)
             except Exception as exc:
                 self.last_tick_error = getattr(exc, 'code', type(exc).__name__)
                 self.operations.health_tick(stamp, False, error=exc)
@@ -292,14 +526,37 @@ class FundService:
         funds = []
         for fund_id in POLICIES:
             item = self.ledger.status(fund_id)
+            retry = self._login_retry.get(fund_id)
+            if fund_id in self.clients:
+                account_state = 'logged_in'
+            elif retry and retry.get('permanent'):
+                account_state = 'relogin_required'
+            elif retry:
+                account_state = 'retrying'
+            else:
+                account_state = 'no_credentials'
+            next_ms = (retry or {}).get('next_ms')
             item.update({'logged_in': fund_id in self.clients,
                          'running': self.store.get('fund_controls', fund_id, {}).get('running', False),
+                         'account': {'state': account_state,
+                                     'error': (retry or {}).get('code'),
+                                     'attempts': int((retry or {}).get('attempts', 0)),
+                                     'retry_in_ms': (max(0, int(next_ms) - stamp)
+                                                     if next_ms is not None else None)},
+                         'settlement': self._settlement_view(fund_id),
                          'policy': POLICIES[fund_id].public(), 'trader': trade.get(fund_id, {})})
             funds.append(item)
         health = self.operations.status()
         health.update({'state': health['network'], 'ok': health['healthy']})
-        detail = ('等待基金账号登录' if not self.clients else
-                  '持续监控' if self.last_tick_ms and stamp - self.last_tick_ms < 15000 else '循环未更新')
+        if self._login_retry:
+            permanent = any(record.get('permanent') for record in self._login_retry.values())
+            detail = '账号连接失败，需要重新登录' if permanent else '账号连接失败，等待重试'
+        elif not self.clients:
+            detail = '等待基金账号登录'
+        elif self.last_tick_ms and stamp - self.last_tick_ms < 15000:
+            detail = '持续监控'
+        else:
+            detail = '循环未更新'
         return {'funds': funds, 'events': self.store.events(50), 'live': self.config.live,
                 'status': {'detail': detail, 'last_health_ms': self.last_tick_ms},
                 'last_tick_ms': self.last_tick_ms, 'last_error': self.last_tick_error,

@@ -41,6 +41,7 @@ from .contracts import (
     BEIJING,
     FundError,
     MONEY_SCALE,
+    money_text,
     POLICIES,
     SHARE_SCALE,
     FundPolicy,
@@ -541,6 +542,19 @@ class FundLedger:
         req['deferred_ms'] = now_ms
         self.store.put(_REDEMPTIONS, req['id'], req)
 
+    def _period_pending_valuation(self, fund_id: str, period: object) -> bool:
+        """Whether ``period``'s settlement is persisted as pending valuation.
+
+        A month whose cutoff price could not be trusted is frozen in
+        ``pending_valuation``; nothing in it has been executed.  That is the
+        narrow condition under which a stale application deadline must not lock
+        an investor's unexecuted request forever.
+        """
+        if not isinstance(period, str) or not period:
+            return False
+        record = self.store.get(_PERIODS, f'{fund_id}:{period}')
+        return bool(record) and record.get('status') == 'pending_valuation'
+
     # ------------------------------------------------------------------- public
     def status(self, fund_id: str, user_id: str | None = None) -> dict:
         fund = self._fund(fund_id)
@@ -724,7 +738,7 @@ class FundLedger:
                     'created_ms': now,
                 })
                 self._notify(fund_id, from_user_id,
-                             f'到账 {amount} 未能匹配有效订单，已记为未认领款待人工核对', now)
+                             f'到账 {money_text(amount)} 小鱼干 未能匹配有效订单，已记为未认领款待人工核对', now)
                 result['status'] = 'unclaimed'
             elif occurred > match['expires_ms']:
                 # Timely payment is judged by the authoritative upstream arrival time.
@@ -738,7 +752,7 @@ class FundLedger:
                 result['status'] = 'refunded'
                 result['refund_payout_id'] = payout['id']
                 self._notify(fund_id, from_user_id,
-                             f'订单 {note} 超时到账，已按原路全额退款 {amount}', now)
+                             f'订单 {note} 超时到账，已按原路全额退款 {money_text(amount)} 小鱼干', now)
             else:
                 # Issuance follows the authoritative arrival time, not the discovery
                 # time.  A payment that arrives after this month's 25th 18:00
@@ -1193,7 +1207,7 @@ class FundLedger:
                             f'本次按可用现金确认 {_shares_text(atoms)} 份额，'
                             f'其余 {_shares_text(deferred)} 份额顺延至 {next_p} 批次，'
                             '未确认部分不注销、不计费。', now,
-                            notice_id=f'settle-redeem-short:{fund_id}:{req["id"]}')
+                            notice_id=f'settle-redeem-short:{fund_id}:{period}:{req["id"]}')
                 self._save_holder(holder)
                 self.store.put(_REDEMPTIONS, req['id'], req)
 
@@ -1282,7 +1296,7 @@ class FundLedger:
             self.store.put(_PERIODS, key, record)
             if declared_total > 0:
                 self._notify(fund_id, None,
-                             f'{period} 分红 {declared_total}，除息净值 {record["exdiv_nav"]}', now)
+                             f'{period} 分红 {money_text(declared_total)} 小鱼干，除息净值 {record["exdiv_nav"]}', now)
             return record
 
     def _pending_period(self, fund_id: str, period: str, now: int, reason: str) -> dict:
@@ -1569,7 +1583,7 @@ class FundLedger:
                                     'exempt': plan['exempt'], 'payout_id': payout['id'],
                                     'remaining_shares_atoms': remaining})
                     self._notify(fund_id, req['user_id'],
-                                 f'紧急赎回已确认：注销 {shares} 份额，费用 {fee}，实付 {payout_units}', now)
+                                 f'紧急赎回已确认：注销 {_shares_text(shares)} 份额，费用 {money_text(fee)} 小鱼干，实付 {money_text(payout_units)} 小鱼干', now)
 
             self._save_fund(fund)
             if results:
@@ -1663,7 +1677,14 @@ class FundLedger:
         if sub['status'] in ('issued', 'refunded'):
             raise FundError('order_settled')  # no undo of issued shares / paid refunds
         deadline = int(sub.get('deadline_ms', sub.get('expires_ms', 0)))
-        if now > deadline:
+        # A received-but-unissued subscription whose month is stuck in
+        # ``pending_valuation`` may still be withdrawn: the money never became
+        # shares, so refunding principal + fee in full is the only way an
+        # unresolved valuation must not lock the request forever.  Issued shares
+        # and already-refunded orders stay untouched.
+        stuck = (sub['status'] == 'received'
+                 and self._period_pending_valuation(fund['fund_id'], sub.get('period')))
+        if now > deadline and not stuck:
             raise FundError('deadline_passed')
         if sub['status'] == 'received':
             principal = int(sub['principal_units'])
@@ -1692,11 +1713,16 @@ class FundLedger:
         # A request whose batch was deferred for lack of liquidity has executed
         # nothing, so the holder may still reclaim the reserved shares even after
         # the batch's original deadline; the draft explicitly allows withdrawing
-        # unexecuted deferred parts.  An ordinary request (and a request already
-        # rolled to a fresh batch, which carries that batch's own deadline) keeps
-        # the normal deadline.  Executed shares/payouts are never reversed here:
-        # only the still-reserved remainder is released.
-        if not req.get('liquidity_deferred') and (not deadline or now > deadline):
+        # unexecuted deferred parts.  The same holds while the request's month is
+        # stuck in ``pending_valuation``: no share of it was confirmed, so the
+        # unexecuted reservation must not be locked by an unpriceable month.  An
+        # ordinary request in a healthy month (and a request already rolled to a
+        # fresh batch, which carries that batch's own deadline) keeps the normal
+        # deadline.  Executed shares/payouts are never reversed here: only the
+        # still-reserved remainder is released.
+        if (not req.get('liquidity_deferred')
+                and not self._period_pending_valuation(fund['fund_id'], req.get('period'))
+                and (not deadline or now > deadline)):
             raise FundError('deadline_passed')
         holder = self._holder(fund['fund_id'], user_id)
         remaining = int(req.get('shares_reserved_atoms', 0))

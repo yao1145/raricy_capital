@@ -5,6 +5,8 @@ After=network-online.target
 Wants=network-online.target
 # 同一份数据只允许一个写者：操作系统级数据档案锁（.raricy-data.lock）随进程退出由
 # 内核释放，不存在需要人工清理的陈旧锁；systemd 单实例只是额外一层。
+# StartLimitIntervalSec=0 关闭启动速率限制，配合 Restart=always 让服务在瞬时断网或
+# 依赖未就绪时**无限重试**，绝不因有限的启动次数上限而永久停摆。
 StartLimitIntervalSec=0
 
 [Service]
@@ -17,16 +19,20 @@ WorkingDirectory=/opt/raricy-funds
 # 该文件由运维在安装后手工放置（见 docs/DEPLOYMENT.md §4）。
 EnvironmentFile=-/etc/raricy-funds/funds.env
 
+# 启动期致命日志（pythonw/无控制台、配置或依赖尚未就绪时）的固定落点。
+# 显式指定后，即使配置加载失败、data_dir 还未知，也能留下脱敏 JSONL。
+Environment=FUNDS_BOOTSTRAP_LOG_DIR=/var/lib/raricy-funds/logs
+
 # 根 CLI 负责信号关停与单写者锁；本 unit 不自建入口。
 ExecStart=/opt/raricy-funds/.venv/bin/python -m raricy_capital --config /etc/raricy-funds/funds.yaml
 
 # 稳定重启：崩溃、被 OOM、被信号打断都拉起来；停止走 SIGTERM，给足对账时间。
+# 不用 StartLimitBurst（它属于 [Unit]，写在 [Service] 里无效）：刻意保留无限重试，
+# 避免在站点还没恢复连通性前就永久停止服务。启动间隔 5 秒由 RestartSec 控制。
 Restart=always
 RestartSec=5
 KillSignal=SIGTERM
 TimeoutStopSec=45
-# 反复拉起也不要无限重启耗尽资源。
-StartLimitBurst=20
 
 # 最小权限：只写自己的数据目录，其余只读。
 NoNewPrivileges=true

@@ -5,9 +5,9 @@
 
 | 文件 | 用途 |
 | --- | --- |
-| `raricy-funds.service` | Linux systemd 服务单元：`Restart=always`、`SIGTERM` 关停、最小权限 |
+| `raricy-funds.service` | Linux systemd 服务单元：`Restart=always` + `StartLimitIntervalSec=0`（无限重试，不用 `StartLimitBurst`）、`SIGTERM` 关停、最小权限 |
 | `raricy-funds-backup.service` / `.timer` | **默认禁用、不由安装脚本安装**的停机窗口一次性备份（见下） |
-| `raricy-funds-tunnel.service` | **运维本机**的 SSH 回环隧道（服务端只监听 127.0.0.1） |
+| `raricy-funds-tunnel.service` | **运维本机**的 systemd **user** 单元：SSH 回环隧道（服务端只监听 127.0.0.1） |
 | `config.example.yaml` | 服务配置样例（字段与 `FundConfig` 一一对应，只有非敏感项） |
 | `funds.env.example` | 运行环境变量样例（只有占位符，绝无真实凭据） |
 | `install.sh` | Linux 安装脚本；默认只装不启用，`--enable` 才启用 |
@@ -33,6 +33,11 @@ unit / 计划任务 / 用户 / 目录名沿用 `raricy-funds`（旧 8127 用的�
   **之前**用 `raricy_capital.data_lock.acquire_data_lock` 取得 OS 生命周期锁
   （`.raricy-data.lock`）；锁随进程退出/崩溃由内核释放，没有需要人工清理的陈旧锁。
   离线运维脚本会取**同一把锁**，服务在线时以 `service_running` 拒绝并发写。
+- **启动期致命日志**：`pythonw`（无控制台）或配置/依赖尚未就绪时的失败写入
+  `<数据目录>/logs/bootstrap.jsonl`（1 MiB × 4 段轮转，脱敏，无异常正文与源码行）。
+  只有稳定错误码、异常类型/errno 与安全的「文件:函数:行」位置。Linux unit 显式设置
+  `FUNDS_BOOTSTRAP_LOG_DIR=/var/lib/raricy-funds/logs`，在配置加载失败、`data_dir`
+  未知时也能落盘；自定义数据目录（尤其 Windows）可设置同名环境变量覆盖默认位置。
 - **备份**：走 SQLite online backup API，**绝不**直接复制运行中的 WAL 库。运行中的
   备份由服务内部每小时执行（`backup_interval_seconds: 3600`），或经控制台已认证的
   `POST /api/backup` 触发；外部每日定时器会开第二个写者，已停用、也不由安装脚本安装。
@@ -55,6 +60,8 @@ unit / 计划任务 / 用户 / 目录名沿用 `raricy-funds`（旧 8127 用的�
 3. 预检 `tools/run_capital_service.py --config /etc/raricy-funds/funds.yaml check`
    （不打开数据库、不取锁）；
 4. `sudo bash packaging/funds/install.sh --enable`；
-5. 在运维本机配置 `raricy-funds-tunnel.service`，浏览器访问 `http://127.0.0.1:8137/`。
+5. 在运维本机把 `raricy-funds-tunnel.service` 装成 systemd **user** 单元
+   （`~/.config/systemd/user/` + `systemctl --user enable --now`），浏览器访问
+   `http://127.0.0.1:8137/`；Windows 运维机直接用文档里的 `ssh -L` 命令。
 
 完整的操作手册、迁移步骤与人工验收清单见 `docs/` 下的 [`docs/DEPLOYMENT.md`](../../docs/DEPLOYMENT.md)。

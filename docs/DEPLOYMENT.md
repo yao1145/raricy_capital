@@ -183,9 +183,16 @@ python -m raricy_capital --config /etc/raricy-funds/funds.yaml --backup # 停机
 
 单元文件：[`packaging/funds/raricy-funds.service`](../packaging/funds/raricy-funds.service)。
 要点：`User=raricy-funds`、`EnvironmentFile=-/etc/raricy-funds/funds.env`、
+`Environment=FUNDS_BOOTSTRAP_LOG_DIR=/var/lib/raricy-funds/logs`、
 `ExecStart=.../python -m raricy_capital --config /etc/raricy-funds/funds.yaml`、
-`Restart=always`、`KillSignal=SIGTERM`、`TimeoutStopSec=45`，并以
+`Restart=always`、`RestartSec=5`、`KillSignal=SIGTERM`、`TimeoutStopSec=45`，并以
 `ProtectSystem=strict` + `ReadWritePaths=/var/lib/raricy-funds` 限制可写范围。
+
+**重启策略是有意无限重试**：unit 设 `StartLimitIntervalSec=0`（关闭启动速率限制）配合
+`Restart=always`，崩溃、被 OOM、被信号打断都会按 `RestartSec=5` 重新拉起，直到站点恢复
+连通。**不要**加 `StartLimitBurst`——它属于 `[Unit]` 段，写在 `[Service]` 里无效；即便
+写对位置，有限次数上限也可能在站点恢复连通前把服务永久停摆，这与「保证最终恢复」相悖。
+启动失败原因见 §9 的 `bootstrap.jsonl`。
 
 ```bash
 sudo systemctl enable --now raricy-funds.service   # 安装脚本的 --enable 等价于这条
@@ -217,8 +224,29 @@ ssh -N -L 127.0.0.1:8137:127.0.0.1:8137 \
     -i ~/.ssh/raricy_funds_tunnel funds-operator@your-server-host
 ```
 
-长期运行可用 [`packaging/funds/raricy-funds-tunnel.service`](../packaging/funds/raricy-funds-tunnel.service)
-（`Restart=always`，`User=%i` 指定运行用户）。浏览器访问 `http://127.0.0.1:8137/`。
+长期运行可用 [`packaging/funds/raricy-funds-tunnel.service`](../packaging/funds/raricy-funds-tunnel.service)：
+它是 **systemd user 单元**，装在**运维/管理员本机**（不是服务器），以当前登录用户身份运行。
+因此它**不写 `User=`，也不使用 `%i`**——`%i` 只对模板单元 `foo@.service` 有定义，本文件名
+不是模板；`SSH_KEY` 用 `%h/.ssh/raricy_funds_tunnel`（当前用户家目录）而不是 `/home/%i/...`。
+
+```bash
+mkdir -p ~/.config/systemd/user
+install -m 0644 packaging/funds/raricy-funds-tunnel.service \
+    ~/.config/systemd/user/raricy-funds-tunnel.service
+# 编辑该文件里的占位符 SERVER=funds-operator@your-server-host（不要臆造服务器 IP）；
+# 专用密钥 ~/.ssh/raricy_funds_tunnel 由运维预先准备，unit 不会自动生成新密钥或授权。
+systemctl --user daemon-reload
+systemctl --user enable --now raricy-funds-tunnel.service
+systemctl --user status raricy-funds-tunnel.service
+```
+
+unit 保留了 `BatchMode=yes`、`ExitOnForwardFailure=yes` 与 `ServerAliveInterval=30` 等
+保活/快速失败选项。浏览器访问 `http://127.0.0.1:8137/`。
+
+- **Windows 运维机**：没有 `systemctl --user`，直接在 PowerShell / cmd 里跑上面的
+  `ssh -N -L ...` 命令（可做成快捷方式或登录脚本），隧道语义完全相同。
+- **服务器上的资金服务单元是另一套**：`raricy-funds.service` 是服务器上的 **system** 级
+  unit（`User=raricy-funds`），与本机这条 user 隧道互不安装在同一台机上，不要混装。
 
 控制台自身的防护：请求必须带回环 `Host` 头（否则 `403 forbidden_host`）；所有写方法
 必须带**同源** `Origin` 与 `Content-Type: application/json`（否则 `403 forbidden_origin`
@@ -276,6 +304,21 @@ python tools/run_capital_service.py --data-dir data/capital_funds status
   （`模块.函数:行号`）与失败类别，不含源码行、异常正文、密码或 Cookie。
 - **进程级输出**：启动信息与致命错误走 stdout/stderr，用
   `journalctl -u raricy-funds.service` 查看（Linux）。
+- **启动期致命日志**：`<数据目录>/logs/bootstrap.jsonl`。入口在载入配置、取数据锁或
+  绑定端口失败时写这一份，**早于**正常的 `funds-ops.jsonl`，因此即使配置还没读出来
+  也有落点。默认目标：有 `--data-dir` 用它，否则仓库默认 `data/capital_funds/logs`；
+  环境变量 `FUNDS_BOOTSTRAP_LOG_DIR` **总是优先**（Linux unit 已设为
+  `/var/lib/raricy-funds/logs`，用于配置加载失败、`data_dir` 未知的场合）；配置合法后
+  改用实际 `config.data_dir/logs`（除非设了该环境变量）。
+  - 轮转有界：单段 1 MiB，保留 3 个备份（共 4 段），文件权限 `0600`（POSIX）。
+  - 每行 JSONL 含 `ts` / `level` / `phase`（`import` / `config` / `lock` / `serve` /
+    `backup`）/ 稳定 `code` / `exit_code`；已知服务错误只记稳定码，其它异常只记
+    **异常类型 + errno + 安全的「文件:函数:行」**。
+  - **绝不**写入 `str(异常)`、源码行文本、请求正文、环境变量、配置内容或凭据；日志写盘
+    失败也不会掩盖原始错误（会尽力在 stderr 输出一行短码）。
+  - **Windows 隐藏计划任务**（`pythonw`，`stdout`/`stderr` 为 `None`）默认写仓库
+    `data/capital_funds/logs`；若 `data_dir` 在别处，或配置在读出 `data_dir` 前就失败，
+    请把 `FUNDS_BOOTSTRAP_LOG_DIR` 设为该数据目录下的 `logs`（用户环境变量）。
 
 ---
 
@@ -458,7 +501,13 @@ sudo systemctl disable --now raricy-funds.service         # 取消启用
 - [ ] 停止服务后，`status` 中 `writer_active` 变为假（锁已由内核释放）；
 - [ ] 服务内部自动备份与 `POST /api/backup` 都产出带 `.sha256` 旁车的备份；
 - [ ] `export` → `verify` → `restore` 闭环成功，包内无凭据；
-- [ ] SSH 隧道能从运维本机打开 `http://127.0.0.1:8137/`，且服务端口未对外暴露；
+- [ ] 服务单元的 `Restart=always` + `StartLimitIntervalSec=0` 生效，且没有启用
+      `StartLimitBurst`（`systemctl show raricy-funds.service -p Restart -p StartLimitIntervalSec`）；
+- [ ] 故意写坏 `funds.yaml` 触发一次启动失败，`<数据目录>/logs/bootstrap.jsonl` 出现
+      含稳定 `code` 的一行且不含异常正文/凭据，服务随后仍按 `RestartSec=5` 重试；
+- [ ] SSH 隧道能从运维本机打开 `http://127.0.0.1:8137/`，且服务端口未对外暴露：
+      Linux 运维机把 `raricy-funds-tunnel.service` 装成 **user** 单元
+      （`systemctl --user enable --now`），Windows 运维机直接跑 `ssh -L` 命令；
 - [ ] 一次真实（或演练）的 `live` 打开与关闭，确认非 live 期间外部写确实被拒；
 - [ ] 升级演练：停机备份 → 重跑 `install.sh` → 重启 → 账目与事件无差异。
 

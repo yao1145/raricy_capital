@@ -850,7 +850,7 @@ def test_cash_short_redemption_scaling_notice_stable_and_amount_unchanged(led):
     assert carried['period'] == '2026-02' and carried['batch'] == '2026-02'
     assert carried['deadline_ms'] == ms(2026, 2, 25, 18)
 
-    key = f'settle-redeem-short:{F}:{req["id"]}'
+    key = f'settle-redeem-short:{F}:2026-01:{req["id"]}'
     msgs = [n for n in led.notices() if n['id'] == key]
     assert len(msgs) == 1 and msgs[0]['user_id'] == 'inst'
     assert '现金' in msgs[0]['content'] and '顺延' in msgs[0]['content']
@@ -860,6 +860,48 @@ def test_cash_short_redemption_scaling_notice_stable_and_amount_unchanged(led):
     assert replay == r
     assert len([n for n in led.notices() if n['id'] == key]) == 1
     assert [p['amount_units'] for p in led.pending_payouts(F)] == [100 * U]
+
+
+def test_cash_short_redemption_notice_carries_period_across_months(led):
+    """A carried request that is cash-short twice gets one notice per period."""
+    t0 = ms(2026, 1, 5)
+    mark(led, 1000, t0)
+    seed(led, 'inst', 1000, t0)
+    led.mark_account(F, 100 * U, 900 * U, ms(2026, 1, 10), ms(2026, 1, 10))
+    req = led.request_redemption(F, 'inst', 500 * U, 'ordinary', 'cs-multi', ms(2026, 1, 10))
+    led.mark_account(F, 100 * U, 900 * U, ms(2026, 1, 31, 23, 59, 55),
+                     ms(2026, 1, 31, 23, 59, 55))
+
+    jan = led.settle_month(F, '2026-01', ms(2026, 2, 2))
+    assert jan['redeemed_shares_atoms'] == 100 * ATOMS
+    jan_key = f'settle-redeem-short:{F}:2026-01:{req["id"]}'
+    jan_notice = led.store.get('notices', jan_key)
+    assert jan_notice is not None and '2026-01' in jan_notice['content']
+    payout = led.pending_payouts(F)[0]
+    assert payout['amount_units'] == 100 * U
+    led.mark_payout_paid(payout['id'], 'tx-jan', ms(2026, 2, 5))
+
+    # February is cash-short again for the same carried remainder, so a distinct
+    # notice keyed by the *February* period must be produced.
+    led.mark_account(F, 50 * U, 950 * U, ms(2026, 2, 28, 23, 59, 55),
+                     ms(2026, 2, 28, 23, 59, 55))
+    feb = led.settle_month(F, '2026-02', ms(2026, 3, 2))
+    carried = led.store.get('redemptions', req['id'])
+    assert carried['cash_scaled'] is True
+    assert carried['shares_confirmed_atoms'] > 0
+    assert carried['shares_reserved_atoms'] > 0
+    assert carried['period'] == '2026-03'
+    feb_key = f'settle-redeem-short:{F}:2026-02:{req["id"]}'
+    assert feb_key != jan_key
+    feb_notice = led.store.get('notices', feb_key)
+    assert feb_notice is not None and '2026-02' in feb_notice['content']
+    assert led.store.get('notices', jan_key)['content'] == jan_notice['content']
+    # Replaying February produces no third notice and no extra payout.
+    payouts_before = len(led.pending_payouts(F))
+    assert led.settle_month(F, '2026-02', ms(2026, 3, 3)) == feb
+    assert led.store.get('notices', feb_key) is not None
+    assert len(led.pending_payouts(F)) == payouts_before
+    assert feb['redeemed_shares_atoms'] > 0
 
 
 # ------------- rule conformance: retained fee must not fake a winning month
@@ -905,3 +947,94 @@ def test_retained_emergency_fee_does_not_create_a_positive_investment_month(led)
     assert Decimal(feb['month_profit_per_share']) < 0
     assert feb['distributable_units'] == 0
     assert feb['dividend_units'] == 0
+
+
+# --------------- rule conformance: unresolved valuation must not lock requests
+def test_cancel_unexecuted_ordinary_redemption_when_period_pending_valuation(led):
+    t0 = ms(2026, 1, 5)
+    mark(led, 1000, t0)
+    seed(led, 'inst', 1000, t0)
+    led.mark_account(F, 1000 * U, 0, ms(2026, 1, 10), ms(2026, 1, 10))
+    req = led.request_redemption(F, 'inst', 500 * U, 'ordinary', 'pv-red', ms(2026, 1, 10))
+
+    # No genuinely pre-cutoff month-end quote: January stays unpriceable.
+    pending = led.settle_month(F, '2026-01', ms(2026, 2, 2))
+    assert pending['status'] == 'pending_valuation'
+    assert pending['reason'] == 'stale_valuation'
+    assert led.pending_payouts(F) == []
+
+    # The 25th deadline is long past, but nothing executed: the unexecuted
+    # reservation must still be reclaimable.
+    out = led.cancel_order(F, 'inst', req['id'], ms(2026, 2, 10))
+    assert out['status'] == 'cancelled'
+    holder = led.holder(F, 'inst')
+    assert holder['shares_atoms'] == 1000 * ATOMS   # no share ever cancelled
+    assert holder['reserved_atoms'] == 0            # reservation released
+    assert out['shares_confirmed_atoms'] == 0       # nothing was confirmed
+    assert led.pending_payouts(F) == []             # and nothing paid
+    # A healthy month still enforces its own deadline.
+    assert led._period_pending_valuation(F, '2026-01') is True
+    assert led._period_pending_valuation(F, '2026-02') is False
+
+
+def test_pending_valuation_cancel_keeps_confirmed_shares_and_past_payout(led):
+    t0 = ms(2026, 1, 5)
+    mark(led, 1000, t0)
+    seed(led, 'inst', 1000, t0)
+    led.mark_account(F, 100 * U, 900 * U, ms(2026, 1, 10), ms(2026, 1, 10))
+    req = led.request_redemption(F, 'inst', 500 * U, 'ordinary', 'pv-carry', ms(2026, 1, 10))
+    led.mark_account(F, 100 * U, 900 * U, ms(2026, 1, 31, 23, 59, 55),
+                     ms(2026, 1, 31, 23, 59, 55))
+
+    jan = led.settle_month(F, '2026-01', ms(2026, 2, 2))
+    assert jan['redeemed_shares_atoms'] == 100 * ATOMS
+    payout = led.pending_payouts(F)[0]
+
+    # The carried remainder's February is unpriceable too.
+    feb = led.settle_month(F, '2026-02', ms(2026, 3, 2))
+    assert feb['status'] == 'pending_valuation'
+
+    out = led.cancel_order(F, 'inst', req['id'], ms(2026, 3, 10))
+    assert out['status'] == 'cancelled'
+    holder = led.holder(F, 'inst')
+    assert holder['reserved_atoms'] == 0               # only the remainder released
+    assert holder['shares_atoms'] == 900 * ATOMS       # confirmed shares stay gone
+    after = led.store.get('redemptions', req['id'])
+    assert after['shares_confirmed_atoms'] == 100 * ATOMS
+    assert after['payout_id'] == payout['id']
+    payouts = led.pending_payouts(F)
+    assert len(payouts) == 1 and payouts[0]['amount_units'] == 100 * U
+
+
+def test_received_subscription_refunded_once_while_period_pending_valuation(led):
+    t0 = ms(2026, 1, 5)
+    mark(led, 1000, t0)
+    seed(led, 'inst', 1000, t0)
+    tsub = ms(2026, 1, 10)
+    sub = led.create_subscription(F, 'u2', 100 * U, 'pv-sub', tsub)
+    received = led.receive_transfer(F, {
+        'transfer_id': 'pv-sub-tx', 'from_user_id': 'u2', 'amount_units': 105 * U,
+        'note': sub['payment_note'], 'occurred_ms': tsub,
+    }, tsub + 1000)
+    assert received['status'] == 'received'
+    mark(led, 1105, tsub + 2000)
+
+    pending = led.settle_month(F, '2026-01', ms(2026, 2, 2))
+    assert pending['status'] == 'pending_valuation'
+
+    # Paid but unissued, and its month cannot be priced: refund principal + fee
+    # in full even though the 25th 18:00 window has long closed.
+    out = led.cancel_order(F, 'u2', sub['id'], ms(2026, 2, 10))
+    assert out['status'] == 'cancelled'
+    st = led.status(F)
+    assert st['pending_receipts_units'] == 0
+    assert st['fee_balance_units'] == 0
+    assert st['shares_atoms'] == 1000 * ATOMS
+    assert st['equity_units'] == 1000 * U
+    payouts = led.pending_payouts(F)
+    assert len(payouts) == 1
+    assert payouts[0]['kind'] == 'refund' and payouts[0]['amount_units'] == 105 * U
+
+    again = led.cancel_order(F, 'u2', sub['id'], ms(2026, 2, 11))
+    assert again['status'] == 'cancelled'
+    assert len(led.pending_payouts(F)) == 1            # refunded exactly once

@@ -1,17 +1,21 @@
 [Unit]
-# 运行在**运维/管理员本机**，不是服务器：把服务器回环端口映射到本地回环。
+# 运行在**运维/管理员本机**（不是服务器）：把服务器回环端口映射到本地回环。
 # 服务端只监听 127.0.0.1，绝不直接暴露到公网；访问一律经这条 SSH 隧道。
+#
+# 这是 **systemd --user** 单元：安装到 ~/.config/systemd/user/raricy-funds-tunnel.service，
+# 用 `systemctl --user daemon-reload && systemctl --user enable --now raricy-funds-tunnel.service`
+# 启用。user 单元天然以当前登录用户身份运行，**不设运行用户**，也不用实例占位符（本文件
+# 名不是模板单元 `foo@.service`，实例占位符只在模板里才有定义）。
 Description=Raricy 资金服务本机 SSH 隧道（127.0.0.1:8137 → 服务器回环）
-Documentation=file:///opt/raricy-funds/docs/DEPLOYMENT.md
 After=network-online.target
 Wants=network-online.target
 StartLimitIntervalSec=0
 
 [Service]
 Type=simple
-User=%i
-# 用部署时生成的专用密钥，口令保护由宿主 ssh-agent 负责；密钥绝不进 unit。
-Environment=SSH_KEY=/home/%i/.ssh/raricy_funds_tunnel
+# 专用密钥放在当前用户家目录；口令保护由宿主 ssh-agent 负责，密钥绝不进 unit。
+# 服务器地址与账号是**占位符**，由运维按实际环境填写，不要臆造服务器 IP 或凭据。
+Environment=SSH_KEY=%h/.ssh/raricy_funds_tunnel
 Environment=SERVER=funds-operator@your-server-host
 Environment=PORT=8137
 # -N 不执行远端命令；ExitOnForwardFailure 让端口占用立即失败而不是静默不转发。
