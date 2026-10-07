@@ -7,6 +7,9 @@
 | 任务 | 文档 |
 | --- | --- |
 | 项目与架构概览 | [根 README](../README.md) |
+| 新代理接手与当前工作状态 | [AGENT_HANDOFF.md](usage/AGENT_HANDOFF.md) |
+| 全部量化研究的路线与最新候选 | [ROADMAP.md](materials/research/ROADMAP.md) |
+| 研究工具、依赖和复现 | [tools/README.md](../tools/README.md) |
 | 协作约定 | [AGENTS.md](../AGENTS.md)、[CLAUDE.md](../CLAUDE.md) |
 | 开发、配置与测试 | [USAGE.md](usage/USAGE.md) |
 | 部署、升级与恢复 | [DEPLOYMENT.md](usage/DEPLOYMENT.md) |
@@ -17,6 +20,9 @@
 | 人工核对接口与账务约束 | [人工核对设计](design/UNCLAIMED_REVIEW.md) |
 | v0.3 基金规则 | [FUND_PLAN_V0.3.md](funds/FUND_PLAN_V0.3.md) |
 | 策略、历史效果与图表 | [INTRODUCTION.md](funds/INTRODUCTION.md) |
+| 新增多空与风险预算研究 | [2026-10-07研究报告](materials/research/long_short_2026-10-07/REPORT.md) |
+| 多空与市场状态进一步优化 | [研究报告](materials/research/bear_regime_2026-10-07/REPORT.md) |
+| 温和与增长档进一步研究 | [两档研究报告](materials/research/dual_tier_2026-10-07/REPORT.md) |
 | 原始研究证据与口径差距 | [研究材料索引](materials/research/README.md) |
 | 推广文案 | [promotion/](../promotion/README.md) |
 | 历史更新记录 | [归档索引](ARCHIVE.md) |

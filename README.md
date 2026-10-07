@@ -143,6 +143,8 @@ README 不声称已完成部署。运维侧请读 [DEPLOYMENT.md](docs/usage/DEP
 
 ## 4. 文档
 
+新代理先读[项目与量化研究交接](docs/usage/AGENT_HANDOFF.md)，再看[研究路线图](docs/materials/research/ROADMAP.md)。最新候选与历史失败分支已汇总；2026-10-07多空研究仍是离线成果，运行策略没有随研究自动更新。
+
 完整导航见 [文档索引](docs/README.md)，历史记录见 [归档索引](docs/ARCHIVE.md)。
 
 | 文档 | 读者 | 内容 |

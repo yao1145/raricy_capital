@@ -4,6 +4,8 @@
 
 ## 实施
 
+接手入口：[AGENT_HANDOFF](docs/usage/AGENT_HANDOFF.md)；研究全貌：[ROADMAP](docs/materials/research/ROADMAP.md)；工具与复现：[tools/README](tools/README.md)。
+
 1. 阅读相关代码和交接说明，确认文件所有权。
 2. 独立任务可以按用户要求并行；每个执行者只修改分配文件，且知道其他人正在工作。
 3. 遇到跨模块契约变化，交给协调者安排调用方与测试更新。不要回滚其他执行者的修改。

@@ -222,3 +222,18 @@ FundSiteClient.qr_png(text, *, box_size=8, border=2) -> bytes   # 本地渲染 P
    （见 §4.4）。trader（D）与运行时装配需按此文件为准，若要改键名须同步改本文件与测试。
 3. `qr_png` 依赖 `qrcode[pil]`（已在 `pyproject.toml` 的 `funds` extra 里声明）。未安装时
    `qr_png` 抛 `qrcode_unavailable`；本模块导入与其他方法不受影响。
+
+
+## 10. 2026-10-07 上游多空与杠杆扩展
+
+核对提交：`d2331679f4886bc96ed79aec4928938fae56437e`。上游现在支持开仓
+`direction=long|short`（省略默认long），杠杆为1–100整数；快捷按钮列表不再是合法值白名单。
+手续费仍按平仓名义仓位收取一次，空头强平价为开仓价×(1＋1/杠杆)，1倍空头也会强平。
+
+本客户端与基金交易链仍采用冻结的旧多头协议、杠杆白名单，本节说明上游差异。
+本次没有改动客户端、真实账号或运行参数。上线多空前需同时适配持久交易意图、仓位方向、
+双向估值/止损/强平及未知结果对账，不能只改开仓请求。
+
+源码：[方向与杠杆](https://github.com/raricycms/raricy.com/blob/d2331679f4886bc96ed79aec4928938fae56437e/src/lib/market-leverage.ts)、
+[结算公式](https://github.com/raricycms/raricy.com/blob/d2331679f4886bc96ed79aec4928938fae56437e/src/lib/market-math.ts)。
+研究结果见[多空优化报告](../materials/research/long_short_2026-10-07/REPORT.md)。
