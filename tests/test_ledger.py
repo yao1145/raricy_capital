@@ -36,6 +36,16 @@ def mark(ledger, fish, when, fund=F):
     ledger.mark_account(fund, int(fish * U), 0, when, when)
 
 
+def mark_held(ledger, fish, held, when, fund=F):
+    """与 ``mark`` 同，但账本额外持有一个非零仓位（钱包不减少，仍够 ``seed`` 发行）。
+
+    空仓账本的权益是纯现金、与价格无关，所以截止时点缺新鲜报价也能如期结算；只有
+    持仓账本才需要保护截止价。测「陈旧报价必须挂起」时必须持有仓位，否则测的就不再
+    是价格陈旧性了。
+    """
+    ledger.mark_account(fund, int(fish * U), int(held * U), when, when)
+
+
 def seed(ledger, user, fish, when, fund=F):
     return ledger.seed(fund, user, int(fish * U), when)
 
@@ -96,7 +106,7 @@ def test_example_month_dividends_match_plan(led):
 # ------------------------------------------------------------ cutoff / valuation
 def test_settle_rejects_lookahead_and_stale_valuation(led):
     t0 = ms(2026, 1, 5)
-    mark(led, 1000, t0)
+    mark_held(led, 1000, 200, t0)
     seed(led, 'inst', 1000, t0)
 
     with pytest.raises(FundError) as exc:
@@ -108,6 +118,25 @@ def test_settle_rejects_lookahead_and_stale_valuation(led):
     assert r['status'] == 'pending_valuation'
     assert r['reason'] == 'stale_valuation'
     assert led.notices(status='queued')
+
+
+def test_flat_book_settles_without_a_fresh_cutoff_quote(led):
+    """空仓账本没有价格敞口，截止时点缺新鲜报价也不得无限期挂起。
+
+    2026-10-07 事故：trader 停摆跨过 09 月批次截止点，两个空仓基金因此卡在
+    ``pending_valuation``。空仓权益是纯现金、与价格无关，此时按现金流结算不会编造
+    任何价格；持仓账本仍必须挂起（见上一条用例）。
+    """
+    t0 = ms(2026, 1, 5)
+    mark(led, 1000, t0)
+    seed(led, 'inst', 1000, t0)
+
+    r = led.settle_month(F, '2026-01', ms(2026, 2, 8))
+    assert r['status'] == 'settled'
+    assert r['late_flat_valuation'] is True
+    assert Decimal(r['nav_before']) == Decimal('1')
+    # 迟到放行必须留痕，便于事后审计。
+    assert any('空仓' in str(n.get('content', '')) for n in led.notices())
 
 
 def test_post_cutoff_flow_cannot_distort_settlement(led):
@@ -412,7 +441,7 @@ def test_month_profit_gate_blocks_losing_month_above_benchmark(led):
 
 def test_retriable_pending_period_completes_with_a_pre_cutoff_mark(led):
     t0 = ms(2026, 1, 5)
-    mark(led, 1000, t0)
+    mark_held(led, 1000, 200, t0)
     seed(led, 'inst', 1000, t0)
 
     first = led.settle_month(F, '2026-01', ms(2026, 2, 8))
@@ -421,7 +450,7 @@ def test_retriable_pending_period_completes_with_a_pre_cutoff_mark(led):
 
     # A late-delivered mark whose quote is genuinely pre-cutoff completes the
     # frozen valuation; the retry settles without a duplicate notice.
-    led.mark_account(F, 1100 * U, 0, ms(2026, 2, 8, 0, 30), ms(2026, 2, 7, 19, 59, 55))
+    led.mark_account(F, 900 * U, 200 * U, ms(2026, 2, 8, 0, 30), ms(2026, 2, 7, 19, 59, 55))
     again = led.settle_month(F, '2026-01', ms(2026, 2, 8, 1))
     assert again['status'] == 'settled'
     assert Decimal(again['nav_before']) == Decimal('1.1')
@@ -430,12 +459,12 @@ def test_retriable_pending_period_completes_with_a_pre_cutoff_mark(led):
 
 def test_post_cutoff_quote_cannot_price_the_month_end(led):
     t0 = ms(2026, 1, 5)
-    mark(led, 1000, t0)
+    mark_held(led, 1000, 200, t0)
     seed(led, 'inst', 1000, t0)
     assert led.settle_month(F, '2026-01', ms(2026, 2, 8))['status'] == 'pending_valuation'
 
     # A fresh *February* quote must never be used as the January cutoff price.
-    led.mark_account(F, 1200 * U, 0, ms(2026, 2, 8, 10), ms(2026, 2, 8, 10))
+    led.mark_account(F, 1000 * U, 200 * U, ms(2026, 2, 8, 10), ms(2026, 2, 8, 10))
     r = led.settle_month(F, '2026-01', ms(2026, 2, 8, 11))
     assert r['status'] == 'pending_valuation'
     assert r['reason'] == 'stale_valuation'
@@ -647,7 +676,7 @@ def test_multiple_post_deadline_revisions_do_not_rewrite_earlier_period(led):
 
 def test_dividend_choice_after_month_end_cannot_rewrite_delayed_period(led):
     t0 = ms(2026, 1, 5)
-    mark(led, 1000, t0)
+    mark_held(led, 1000, 200, t0)
     seed(led, 'inst', 1000, t0)
     led.set_dividend_choice(F, 'inst', Decimal('0.5'), ms(2026, 1, 20))
     led.trade_realized(F, 'dly1', 100 * U, ms(2026, 1, 20))
@@ -659,7 +688,7 @@ def test_dividend_choice_after_month_end_cannot_rewrite_delayed_period(led):
     # A revision after month-end but before the delayed settlement only governs
     # February onward and must not rewrite January.
     led.set_dividend_choice(F, 'inst', 1, ms(2026, 2, 8, 0, 15))
-    led.mark_account(F, 1100 * U, 0, ms(2026, 2, 8, 0, 30), ms(2026, 2, 7, 19, 59, 55))
+    led.mark_account(F, 900 * U, 200 * U, ms(2026, 2, 8, 0, 30), ms(2026, 2, 7, 19, 59, 55))
     jan = led.settle_month(F, '2026-01', ms(2026, 2, 8, 1))
     assert jan['status'] == 'settled'
     assert jan['reinvest_value_units'] == 5 * U
@@ -953,9 +982,9 @@ def test_retained_emergency_fee_does_not_create_a_positive_investment_month(led)
 # --------------- rule conformance: unresolved valuation must not lock requests
 def test_cancel_unexecuted_ordinary_redemption_when_period_pending_valuation(led):
     t0 = ms(2026, 1, 5)
-    mark(led, 1000, t0)
+    mark_held(led, 1000, 200, t0)
     seed(led, 'inst', 1000, t0)
-    led.mark_account(F, 1000 * U, 0, ms(2026, 1, 6), ms(2026, 1, 6))
+    led.mark_account(F, 800 * U, 200 * U, ms(2026, 1, 6), ms(2026, 1, 6))
     req = led.request_redemption(F, 'inst', 500 * U, 'ordinary', 'pv-red', ms(2026, 1, 6))
 
     # No genuinely pre-cutoff cutoff quote: the period stays unpriceable.
@@ -1009,7 +1038,7 @@ def test_pending_valuation_cancel_keeps_confirmed_shares_and_past_payout(led):
 
 def test_received_subscription_refunded_once_while_period_pending_valuation(led):
     t0 = ms(2026, 1, 5)
-    mark(led, 1000, t0)
+    mark_held(led, 1000, 200, t0)
     seed(led, 'inst', 1000, t0)
     tsub = ms(2026, 1, 6)
     sub = led.create_subscription(F, 'u2', 100 * U, 'pv-sub', tsub)
@@ -1018,7 +1047,8 @@ def test_received_subscription_refunded_once_while_period_pending_valuation(led)
         'note': sub['payment_note'], 'occurred_ms': tsub,
     }, tsub + 1000)
     assert received['status'] == 'received'
-    mark(led, 1105, tsub + 2000)
+    # 权益与原来一致（1105U），只是其中 200U 记为仓位。
+    led.mark_account(F, 905 * U, 200 * U, tsub + 2000, tsub + 2000)
 
     pending = led.settle_month(F, '2025-12', ms(2026, 1, 8))
     assert pending['status'] == 'pending_valuation'

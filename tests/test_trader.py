@@ -13,6 +13,7 @@ from pathlib import Path
 import pytest
 
 from raricy_capital import strategy as S
+from raricy_capital.client import FundSiteError
 from raricy_capital.contracts import FundError, POLICIES
 from raricy_capital.store import FundStore
 from raricy_capital.trader import FundTrader
@@ -119,6 +120,8 @@ class FakeClient:
         self.buy_raises = False
         self.sell_payout = '0.0000'
         self.on_buy = None
+        # 站点 2026-10-07 起不再下发杠杆白名单；空列表代表「1–100 整数」。
+        self.leverage_options = [1, 2, 3, 5, 10, 20]
 
     async def snapshot(self):
         self.calls.append('snapshot')
@@ -126,7 +129,7 @@ class FakeClient:
             raise RuntimeError('network')
         return {'balance': self.wallet_units / 10000.0, 'positions': list(self.positions),
                 'feeRate': self.fee_rate, 'minStake': 1, 'leverageEnabled': True,
-                'leverageOptions': [1, 2, 3, 5, 10, 20]}
+                'leverageOptions': self.leverage_options}
 
     async def balance(self):
         return self.wallet_units
@@ -428,6 +431,31 @@ async def test_failed_mark_freezes_peak_and_nav(tmp_path):
     state = state_of(store)
     assert state['mark_failed'] is True and state['last_error'] == 'RuntimeError'
     assert state['peak'] == peak and state['nav'] == nav
+
+
+async def test_mark_error_records_site_error_code(tmp_path):
+    # 站点类别码必须透传；否则 snapshot_unavailable 会被记成笼统的 FundSiteError。
+    trader, store, ledger, client = make(tmp_path)
+
+    class Boom:
+        async def snapshot(self):
+            raise FundSiteError('snapshot_unavailable')
+
+    trader.clients[FUND] = Boom()
+    await trader.tick(boundary(BASE + 300 * H) + 20000)
+    state = state_of(store)
+    assert state['mark_failed'] is True
+    assert state['last_error'] == 'snapshot_unavailable'
+
+
+async def test_empty_leverage_options_is_not_a_block(tmp_path):
+    # 站点新形状：leverageOptions 缺省（等价空列表）表示「1–100 整数」，不是「无杠杆」。
+    trader, store, ledger, client = make(tmp_path)
+    client.leverage_options = []
+    await trader.tick(boundary(BASE + 300 * H) + 20000)
+    state = state_of(store)
+    assert state['mark_failed'] is False
+    assert state['blocked'] != 'site_leverage_unavailable'
 
 
 @pytest.mark.asyncio

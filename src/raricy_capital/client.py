@@ -59,8 +59,11 @@ SESSION_COOKIE_NAME = "raricy_session"
 SYMBOL = "BTCUSDT"
 DEFAULT_INTERVAL = "1h"
 MARKET_INTERVALS = ("1m", "5m", "15m", "1h", "4h", "1d")
-# 服务端认的杠杆白名单 = 阶梯 ∪ 彩票档（market-service.ts）。
-LEVERAGES = (1, 2, 3, 5, 10, 20, 100)
+# 站点 2026-10-07（d2331679）起把杠杆从固定白名单放宽为 **1–100 整数**，快捷按钮
+# 不再是合法值白名单；服务端只做范围校验。本客户端同步接受整个区间（与 research
+# 的整数多空口径一致）。capital1=3、capital2=5 都在区间内，实际下单不变。
+LEVERAGE_MIN = 1
+LEVERAGE_MAX = 100
 
 # 与站点一致的上限（fish-market-service.ts / order 参数口径）。
 NOTE_MAX = 30
@@ -714,6 +717,7 @@ class FundSiteClient:
               'balance_units': int,
               'fee_rate': float,
               'min_stake_units': int,
+              # 空列表表示站点不再下发白名单：杠杆是 1–100 整数（LEVERAGE_MIN..MAX）。
               'leverage_options': list[int],
               'leverage_enabled': bool,
               'positions': [
@@ -777,7 +781,8 @@ class FundSiteClient:
         """
         await self._ensure_login()
         units = self._validate_units(amount)
-        if isinstance(leverage, bool) or leverage not in LEVERAGES:
+        if (isinstance(leverage, bool) or not isinstance(leverage, int)
+                or not LEVERAGE_MIN <= leverage <= LEVERAGE_MAX):
             raise FundSiteError("leverage_invalid")
         if not isinstance(key, str) or CLIENT_KEY_RE.fullmatch(key) is None:
             raise FundSiteError("key_invalid")

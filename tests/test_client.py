@@ -524,13 +524,33 @@ async def test_buy_parses_position_with_real_utc():
     }
 
 
-async def test_buy_rejects_leverage_outside_whitelist():
+async def test_buy_leverage_only_range_checked():
+    # 2026-10-07（d2331679）起服务端不再认白名单，只校验 1–100 整数；4 这种非阶梯值必须放行。
+    site = Site()
+    site.on("POST", "/api/fish/trade/buy")(
+        lambda _r: _env(200, balance=10, replayed=False,
+                        position={"id": "c1", "symbol": SYMBOL, "stake": 1,
+                                  "entry_price": 1.0, "leverage": 4,
+                                  "liquidation_price": 0.0,
+                                  "opened_at": "2026-10-03T14:22:03.000Z"})
+    )
+    client = await make_client(site)
+    try:
+        result = await client.buy(10_000, 4, "mrk-lev4")
+    finally:
+        await client.close()
+    assert result["leverage"] == 4
+    assert last_json(site)["leverage"] == 4
+
+
+async def test_buy_rejects_leverage_outside_range():
     site = Site()
     client = await make_client(site)
     try:
-        with pytest.raises(FundSiteError) as excinfo:
-            await client.buy(100_000, 4, "mrk-1")
-        assert excinfo.value.code == "leverage_invalid"
+        for bad in (0, 101, 1000, -3, 2.5, True):
+            with pytest.raises(FundSiteError) as excinfo:
+                await client.buy(100_000, bad, "mrk-1")
+            assert excinfo.value.code == "leverage_invalid"
     finally:
         await client.close()
 
@@ -583,7 +603,6 @@ async def test_snapshot_parses_trade_page_props():
         ],
         "feeRate": 0.0002,
         "minStake": 1,
-        "leverageOptions": [1, 2, 3, 5, 10, 20, 100],
         "leverageEnabled": True,
     }
     line = "3:" + json.dumps(panel, separators=(",", ":"))
@@ -598,7 +617,9 @@ async def test_snapshot_parses_trade_page_props():
         await client.close()
     assert snap["balance_units"] == 425_000
     assert snap["min_stake_units"] == 10_000
-    assert snap["leverage_options"] == [1, 2, 3, 5, 10, 20, 100]
+    # 站点不再下发杠杆白名单：空列表代表「1–100 整数」而不是「无可用杠杆」。
+    assert snap["leverage_options"] == []
+    assert snap["leverage_enabled"] is True
     pos = snap["positions"][0]
     assert pos["stake_units"] == 100_000
     assert pos["liquidation_price"] == 54729.88

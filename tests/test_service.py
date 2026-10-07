@@ -382,13 +382,14 @@ async def test_older_pending_month_is_retried_and_blocks_newer_months(tmp_path, 
     led = service.ledger
     try:
         t0 = _ms(2026, 1, 5)
-        led.mark_account('capital1', 1000 * U, 0, t0, t0)
+        # 持仓账本才有价格敞口：空仓账本的权益是纯现金，陈旧报价不再挂起结算。
+        led.mark_account('capital1', 1000 * U, 200 * U, t0, t0)
         led.seed('capital1', 'inst', 1000 * U, t0)
         first = led.settle_month('capital1', '2026-01', _ms(2026, 2, 8))
         assert first['status'] == 'pending_valuation'
 
         # February's own book is valid, but January is still unresolved.
-        led.mark_account('capital1', 1000 * U, 0, _ms(2026, 2, 28, 23, 59, 55),
+        led.mark_account('capital1', 1000 * U, 200 * U, _ms(2026, 2, 28, 23, 59, 55),
                          _ms(2026, 2, 28, 23, 59, 55))
         await service._settlements(_ms(2026, 3, 8))
 
@@ -419,7 +420,7 @@ async def test_valid_older_snapshot_settles_in_sequence_and_dedups(tmp_path, mon
     led = service.ledger
     try:
         t0 = _ms(2026, 1, 5)
-        led.mark_account('capital1', 1000 * U, 0, t0, t0)
+        led.mark_account('capital1', 1000 * U, 200 * U, t0, t0)
         led.seed('capital1', 'inst', 1000 * U, t0)
         assert led.settle_month('capital1', '2026-01', _ms(2026, 2, 8))['status'] == 'pending_valuation'
 

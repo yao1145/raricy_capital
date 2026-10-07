@@ -84,7 +84,6 @@ def test_parse_trade_page_reads_props_and_rejects_shape_changes():
         ],
         'feeRate': 0.0002,
         'minStake': 1,
-        'leverageOptions': [1, 2, 3, 5, 10, 20, 100],
         'leverageEnabled': True,
     }
     line = '3:' + json.dumps(panel, separators=(',', ':'))

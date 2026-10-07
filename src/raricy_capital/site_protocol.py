@@ -36,7 +36,11 @@ def parse_trade_page(html: str) -> dict:
 
     def walk(x):
         if isinstance(x, dict):
-            if {'balance', 'positions', 'feeRate', 'minStake', 'leverageOptions', 'leverageEnabled'} <= x.keys():
+            # 面板必备键故意不含 ``leverageOptions``：站点 2026-10-07 起把杠杆从
+            # props 白名单改成「1–100 整数 + 服务端范围校验」，页面不再渲染该数组。
+            # 新形状（缺 ``leverageOptions``）与旧形状（带该数组）都接受；客户端把缺失
+            # 视为「整数范围内任意值」，见 client.LEVERAGE_MIN / LEVERAGE_MAX。
+            if {'balance', 'positions', 'feeRate', 'minStake', 'leverageEnabled'} <= x.keys():
                 panels.append(x)
             for v in x.values():
                 walk(v)

@@ -1820,8 +1820,20 @@ class FundLedger:
             if snapshot is None:
                 return self._pending_period(fund_id, period, now, 'missing_snapshot')
             quote_ms = snapshot['quote_ms']
+            late_flat_valuation = False
             if quote_ms <= 0 or quote_ms > cutoff or cutoff - quote_ms > self.max_quote_age_ms:
-                return self._pending_period(fund_id, period, now, 'stale_valuation')
+                # A flat book carries no price exposure: equity is pure cash, so an
+                # absent/late cutoff quote cannot mis-value the period and must not
+                # stall the batch forever.  This is the *only* exception, and it
+                # requires the frozen book to be exactly flat -- a held lot still
+                # hangs rather than letting a post-cutoff price impersonate the
+                # cutoff price.  ``position_value_units`` is the value the trader
+                # marked into this frozen book, so a lot that merely became worthless
+                # still reads as held here and keeps the gate.
+                held = snapshot.get('position_value_units')
+                if not (isinstance(held, int) and not isinstance(held, bool) and held == 0):
+                    return self._pending_period(fund_id, period, now, 'stale_valuation')
+                late_flat_valuation = True
 
             fund = self._fund(fund_id)
             S = snapshot['shares_atoms']
@@ -2061,6 +2073,8 @@ class FundLedger:
                 'settled': True,
                 'settled_ms': now,
                 'cutoff_ms': cutoff,
+                # 截止时点缺新鲜报价、仅因账本空仓而放行的迟到结算：留痕备审。
+                'late_flat_valuation': late_flat_valuation,
                 'nav_before': _nav_text(nav_before),
                 'period_start_nav': _nav_text(period_start_nav),
                 'month_profit_per_share': _nav_text(month_profit),
@@ -2085,6 +2099,10 @@ class FundLedger:
                 'subscriptions_issued': issued_subs,
             })
             self.store.put(_PERIODS, key, record)
+            if late_flat_valuation:
+                self._notify(fund_id, None,
+                             f'{period} 结算批次在截止时点无有效报价，因账本空仓（无价格敞口）'
+                             f'按现金权益结算，净值 {record["nav_before"]}', now)
             if declared_total > 0:
                 self._notify(fund_id, None,
                              f'{period} 分红 {money_text(declared_total)} 小鱼干，除息净值 {record["exdiv_nav"]}', now)

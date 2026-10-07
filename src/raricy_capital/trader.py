@@ -139,7 +139,8 @@ class FundTrader:
                     now_ms: int, code: str | None = None) -> None:
         # Only the exception category is recorded; upstream bodies/credentials
         # are never echoed into state or events.
-        code = code or type(exc).__name__
+        raw = code or getattr(exc, 'code', None)
+        code = raw if isinstance(raw, str) and raw else type(exc).__name__
         state['mark_failed'] = True
         state['last_error'] = code
         self._save(fund_id, state)
@@ -229,8 +230,10 @@ class FundTrader:
             state['blocked'] = 'fee_changed'
             self._event(fund_id, 'fee_changed', {'fee_rate': float(fee_rate)}, now_ms, 'warning')
         options = snapshot.get('leverageOptions')
+        # 空列表或缺失 = 站点不再下发杠杆白名单（2026-10-07 起为 1–100 整数），
+        # 不是「无杠杆可用」；只有站点真的给出非空白名单时才按它拦。
         if snapshot.get('leverageEnabled') is False or (
-                isinstance(options, list) and policy.leverage not in options):
+                isinstance(options, list) and options and policy.leverage not in options):
             state['blocked'] = 'site_leverage_unavailable'
             self._event(fund_id, 'site_leverage_unavailable', None, now_ms, 'warning')
         raw_min = snapshot.get('minStake')

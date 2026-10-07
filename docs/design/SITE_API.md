@@ -127,7 +127,8 @@ FundSiteClient.qr_png(text, *, box_size=8, border=2) -> bytes   # 本地渲染 P
 | `await sell(position_id) -> dict` | `POST /api/fish/trade/sell` | 见下 |
 
 常量：`SYMBOL="BTCUSDT"`、`DEFAULT_INTERVAL="1h"`、`MARKET_INTERVALS=("1m","5m","15m","1h","4h","1d")`、
-`LEVERAGES=(1,2,3,5,10,20,100)`（站点白名单，非白名单值本地拒绝，不就近取整）。
+`LEVERAGE_MIN=1`、`LEVERAGE_MAX=100`（站点 2026-10-07 起杠杆为 **1–100 整数**，不再有白名单；
+非整数或越界本地拒绝，不就近取整）。
 
 `quote` 返回的价**只用于风控判断**，真实成交价由服务端在下单那一刻现取，并出现在 `buy`/`sell`
 的 `entry_price` / `exit_price` 里。站点这份展示缓存的阈值是 `QUOTE_STALE_MS=40s`（REST 轮询
@@ -141,7 +142,7 @@ FundSiteClient.qr_png(text, *, box_size=8, border=2) -> bytes   # 本地渲染 P
   "balance_units": int,
   "fee_rate": float,
   "min_stake_units": int,
-  "leverage_options": list[int],
+  "leverage_options": list[int],   # 站点不再下发白名单，恒为空 []，代表 1–100 整数
   "leverage_enabled": bool,
   "positions": [
     {"position_id", "symbol", "stake_units", "entry_price",
@@ -230,7 +231,8 @@ FundSiteClient.qr_png(text, *, box_size=8, border=2) -> bytes   # 本地渲染 P
 `direction=long|short`（省略默认long），杠杆为1–100整数；快捷按钮列表不再是合法值白名单。
 手续费仍按平仓名义仓位收取一次，空头强平价为开仓价×(1＋1/杠杆)，1倍空头也会强平。
 
-本客户端与基金交易链仍采用冻结的旧多头协议、杠杆白名单，本节说明上游差异。
+本客户端已同步杠杆语义：`client.buy` 接受 1–100 任意整数（`LEVERAGE_MIN`/`LEVERAGE_MAX`），
+快照解析不再要求 `leverageOptions` 键。仍采用冻结的旧多头协议（不传 `direction`），本节说明上游差异。
 本次没有改动客户端、真实账号或运行参数。上线多空前需同时适配持久交易意图、仓位方向、
 双向估值/止损/强平及未知结果对账，不能只改开仓请求。
 
